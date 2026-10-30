@@ -7,7 +7,7 @@ a small **web page** and a few **serial commands**.
 
 Version 1.2 (firmware binaries: see the GitHub Releases page). Original work: HB9IIU. Extensions: DG7NDV (2026). Licence stays Apache-2.0, see `docs/LICENSE` and `docs/NOTICE`.
 
-> **Status:** developed and tested only on the 2.8" CYD (ESP32-2432S028R, `CYD28Inch`) with an
+> **Status:** developed and tested only on the 2.8" CYD (type ESP32-2432S028, `CYD28Inch`) with an
 > [ESP32-DATV](https://github.com/SP8ESA/ESP32-DATV) transmitter as signal source. The 4" build compiles
 > from the same sources but was not tried. Items marked *untested* below were built but not verified on hardware.
 
