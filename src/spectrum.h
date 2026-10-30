@@ -22,8 +22,9 @@ static_assert(kBandLowKHz >= kCaptureCenterMHz * 1000 - kCaptureSpanKHz / 2 &&
 
 // View modes: narrow = one 16 MHz capture around gCaptureCenterMHz (31.25 kHz bins);
 // wlan/max = stepped sweep of 12 MHz windows stitched into 512 display bins.
-enum RangeMode { kRangeNarrow = 0, kRangeWlan = 1, kRangeMax = 2 };
+enum RangeMode { kRangeNarrow = 0, kRangeWlan = 1, kRangeMax = 2, kRangeCustom = 3 };
 extern volatile int gRangeMode;
+extern volatile int gRangeLowMHz, gRangeHighMHz;   // used by kRangeCustom ("range <lo> <hi>")
 constexpr int kWlanLowMHz = 2400, kWlanHighMHz = 2484;
 constexpr int kMaxLowMHz = 2300, kMaxHighMHz = 2500;
 constexpr int kSweepStepKHz = 12000;     // usable part of each 16 MHz capture

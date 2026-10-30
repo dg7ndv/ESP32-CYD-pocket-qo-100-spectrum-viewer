@@ -5,7 +5,7 @@ keeps everything of the original (touch gestures, trace styles, waterfall palett
 and adds a **tunable receive frequency (2300–2500 MHz)**, two **wide sweep views**, a **touch menu**,
 a small **web page** and a few **serial commands**.
 
-Original work: HB9IIU. Extensions: DG7NDV (2026). Licence stays Apache-2.0, see `docs/LICENSE` and `docs/NOTICE`.
+Version 1.2 (firmware binaries: see the GitHub Releases page). Original work: HB9IIU. Extensions: DG7NDV (2026). Licence stays Apache-2.0, see `docs/LICENSE` and `docs/NOTICE`.
 
 > **Status:** developed and tested only on the 2.8" CYD (ESP32-2432S028R, `CYD28Inch`) with an
 > [ESP32-DATV](https://github.com/SP8ESA/ESP32-DATV) transmitter as signal source. The 4" build compiles
@@ -39,6 +39,7 @@ freq 2370        centre the 16 MHz window on 2370 MHz (integer MHz, 2300..2500)
 qo100            back to the default QO-100 view (centre 2406 MHz)
 rangewlan        sweep 2400-2484 MHz
 maxrange         sweep 2300-2500 MHz
+range 2380 2430  sweep any range: start < end, 2300..2500 MHz, at most 204 MHz wide
 stop / start     pause / resume the receiver
 status           print centre frequency and the current CF/SR result
 ```
@@ -85,6 +86,7 @@ Notes and limits:
 |---|---|
 | `freq <MHz>` | centre of the single-window view, 2300..2500 |
 | `qo100` / `rangewlan` / `maxrange` | view modes (table above) |
+| `range <start> <end>` | sweep a free range in whole MHz (2300..2500, max. 204 MHz wide; invalid values are rejected) |
 | `stop` / `start` | pause / resume |
 | `status` | centre frequency + CF/SR |
 | `cal <kHz>` | add a fixed kHz correction to the displayed CF (saved in flash) |
@@ -92,6 +94,9 @@ Notes and limits:
 | `cal` | show the current correction |
 | `wifi <ssid> <password>` | save home Wi-Fi credentials (no spaces); `wifi` shows the saved SSID, `wifi clear` removes it |
 | `layout`, `mode`, `wf`, `burst`, `help` | unchanged from the original |
+
+In sweep views the peak is printed as `[pk] 2403.8 MHz level=215`. Without any signal the peak often shows the
+first bin of the range (e.g. 2400.0 MHz); this is probably an edge artefact of the first window and not a signal.
 
 Machine-readable output on USB: `[cf] 2403.859 MHz sr=500 ksps` (or `[cf] none`) in the single-window views,
 whenever the value changes and every 2 s while a signal is detected.
@@ -119,7 +124,21 @@ The per-second `[touch] idle …` debug lines of the original are muted.
   BOOT. **This did not work on the tested board** (GPIO0 is not held across the reset); flash with the
   BOOT button as usual.
 
-## 5. Build and flash
+## 5. Control GUI (`tools/spek_control.py`)
+
+Small Python/tkinter program for the USB serial port (needs `pip install pyserial`; tkinter ships with Python,
+Linux: `sudo apt install python3-tk`). Tested on Linux only, Windows/macOS should work but are untested.
+
+```bash
+python3 tools/spek_control.py
+```
+
+Port selection with auto-search, Start / Stop / Status, QO-100 / WLAN / MAX buttons, start and end frequency
+boxes (type or mouse wheel per digit, saved), 10 memory slots (click = recall or store, right click = overwrite,
+L = delete, R = rename) and a large display of the received CF / symbol rate / peak. Opening the port resets the
+board on many systems, so wait ~7 s after connecting.
+
+## 6. Build and flash
 
 ```bash
 pio run -e CYD28Inch -j 2
@@ -129,8 +148,8 @@ pio run -e CYD28Inch -t upload --upload-port /dev/ttyUSB0     # BOOT held while 
 With a system `pio` that is too old/new for your Python, a virtualenv with `pip install platformio` works.
 The browser installer linked at the top of the original README installs the **original** firmware.
 
-## 6. Files changed
+## 7. Files changed
 
 `src/main.cpp` (menu, web, serial commands, sweep, CF output), `src/spectrum.{h,cpp}` (runtime centre, raw mode),
 `src/esp_sdr.{h,cpp}` (wider tuning range, `espSdrEnd`, quiet retune), `src/touch_input.cpp` (idle log muted),
-`partitions_ota.csv` (optional), this file.
+`partitions_ota.csv` (optional), `tools/spek_control.py`, this file.

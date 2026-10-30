@@ -696,8 +696,11 @@ static void receiverTask(void*) {
         uint32_t captureUs = 0;
         if (configured && rangeMode != kRangeNarrow
             && acquireWide(processor, samples, frame,
-                           rangeMode == kRangeWlan ? kWlanLowMHz : kMaxLowMHz,
-                           rangeMode == kRangeWlan ? kWlanHighMHz : kMaxHighMHz, captureUs)) {
+                           rangeMode == kRangeWlan ? kWlanLowMHz
+                               : rangeMode == kRangeCustom ? (int)gRangeLowMHz : kMaxLowMHz,
+                           rangeMode == kRangeWlan ? kWlanHighMHz
+                               : rangeMode == kRangeCustom ? (int)gRangeHighMHz : kMaxHighMHz,
+                           captureUs)) {
             // wide frame complete
         } else if (configured && rangeMode == kRangeNarrow
                    && espSdrAcquireBurst(samples, kSpectrumBins, kCaptureClock, &captureUs)) {
@@ -803,7 +806,8 @@ static MenuButton menuButtons[10];
 static int menuButtonCount = 0;
 
 static const char* modeName(int mode) {
-    return mode == kRangeWlan ? "WLAN 2400-2484" : mode == kRangeMax ? "MAX 2300-2500" : "CENTRE";
+    return mode == kRangeWlan ? "WLAN 2400-2484" : mode == kRangeMax ? "MAX 2300-2500"
+         : mode == kRangeCustom ? "CUSTOM range" : "CENTRE";
 }
 
 static void drawMenuButton(const MenuButton& b, bool selected, uint16_t fill) {
@@ -846,6 +850,8 @@ static void drawMenu() {
     drawMenuButton(menuButtons[8], false, color::rgb(120, 60, 0));
     char line[64];
     if (menuMode == kRangeNarrow) snprintf(line, sizeof(line), "Centre %d MHz (16 MHz window)", menuCenter);
+    else if (menuMode == kRangeCustom)
+        snprintf(line, sizeof(line), "Sweep: %d-%d MHz (custom)", (int)gRangeLowMHz, (int)gRangeHighMHz);
     else snprintf(line, sizeof(line), "Sweep: %s MHz", modeName(menuMode));
     tft.setTextDatum(TC_DATUM);
     tft.setTextColor(color::BRIGHT, color::BG);
@@ -1144,6 +1150,21 @@ static void handleSerial() {
                 if (!strcmp(line, "bootloader")) {
                     rebootToBootloader();
                 }
+                if (!strncmp(line, "range ", 6)) {
+                    int lo = 0, hi = 0;
+                    if (sscanf(line + 6, "%d %d", &lo, &hi) == 2 && lo >= 2290 && hi <= 2510
+                        && hi > lo && hi - lo <= kSweepMaxWindows * (kSweepStepKHz / 1000)) {
+                        gRangeLowMHz = lo;
+                        gRangeHighMHz = hi;
+                        gRangeMode = kRangeCustom;
+                        Serial.printf("[rx] range: custom %d-%d MHz\n", lo, hi);
+                    } else {
+                        Serial.printf("[rx] range <start> <end>: 2290..2510 MHz, at most %d MHz wide\n",
+                                      kSweepMaxWindows * (kSweepStepKHz / 1000));
+                    }
+                    used = 0;
+                    continue;
+                }
                 if (!strcmp(line, "maxrange") || !strcmp(line, "rangewlan") || !strcmp(line, "qo100")) {
                     if (line[0] == 'm') gRangeMode = kRangeMax;
                     else if (line[0] == 'r') gRangeMode = kRangeWlan;
@@ -1216,7 +1237,7 @@ static void handleSerial() {
                     used = 0;
                     continue;
                 }
-                Serial.println("Commands: wifi <ssid> <pass> | wifi clear | bootloader (download mode for flashing) | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
+                Serial.println("Commands: range <start> <end> (MHz sweep) | wifi <ssid> <pass> | wifi clear | bootloader (download mode for flashing) | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
                                "wf 0-4 (classic|thermal|phosphor|gray|rainbow) | help");
             }
             used = 0; overflow = false;
