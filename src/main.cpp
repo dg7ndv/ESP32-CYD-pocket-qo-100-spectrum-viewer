@@ -3,6 +3,16 @@
 #include <TFT_eSPI.h>
 #include <Preferences.h>
 #include <stdlib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+#include "soc/rtc_cntl_reg.h"
+#include "driver/rtc_io.h"
+#ifndef RTC_CNTL_OPTION1_REG
+// ESP32 TRM: RTC_CNTL_OPTION1_REG (0x3FF48128), bit 0 = FORCE_DOWNLOAD_BOOT.
+#define RTC_CNTL_OPTION1_REG (DR_REG_RTCCNTL_BASE + 0x128)
+#define RTC_CNTL_FORCE_DOWNLOAD_BOOT 1
+#endif
 #include <string.h>
 #include "esp_sdr.h"
 #include "spectrum.h"
@@ -100,6 +110,19 @@ static int normalizeSymbolRateKsps(int measuredKsps) {
             && measuredKsps <= nominalRatesKsps[nominalRateCount - 1]
         ? nearestRate
         : measuredKsps;
+}
+
+// Frequency correction in kHz, added to the measured centre frequency (persisted).
+static volatile int calOffsetKHz = 0;
+
+static void saveCalOffset() {
+    Preferences settings;
+    if (settings.begin("shcfg", false)) {
+        settings.putInt("calkhz", calOffsetKHz);
+        settings.end();
+    } else {
+        Serial.println("[cf] ERROR: could not save calibration");
+    }
 }
 
 static void saveDisplayStyles() {
@@ -306,7 +329,7 @@ static void updateTransmissionCenter(const uint8_t* values, int lo, int hi) {
 
     if (bestLength >= kCenterMinBins) {
         const int midpointBinTimes2 = 2 * bestStart + bestLength - 1;
-        const int measuredKHz = kCaptureLowKHz
+        const int measuredKHz = calOffsetKHz + captureLowKHz()
             + (midpointBinTimes2 * kCaptureSpanKHz + kSpectrumBins)
                 / (2 * kSpectrumBins);
         const int plateauEdge = bestLength / 5;
@@ -350,15 +373,58 @@ static void updateTransmissionCenter(const uint8_t* values, int lo, int hi) {
     }
 }
 
+static bool viewWide = false;
+static int viewLowMHz = 0, viewHighMHz = 0;
+
+// Sweep view: strongest display bin on serial, e.g. "[pk] 2403.8 MHz level=180".
+static void reportPeak(const SpectrumFrame& frame) {
+    static uint32_t lastPrint = 0;
+    const uint32_t now = millis();
+    if (now - lastPrint < 2000) return;
+    lastPrint = now;
+    int best = 0;
+    for (int i = 1; i < kSpectrumBins; ++i) if (frame.bins[i] > frame.bins[best]) best = i;
+    const int khz = frame.lowMHz * 1000
+        + (int)(((int64_t)best * 2 + 1) * (frame.highMHz - frame.lowMHz) * 1000 / (2 * kSpectrumBins));
+    Serial.printf("[pk] %d.%01d MHz level=%u\n", khz / 1000, (khz % 1000) / 100, frame.bins[best]);
+}
+
+// Machine-readable result on USB serial: "[cf] 2403.750 MHz sr=500 ksps" or "[cf] none".
+// Printed on change (rate-limited) and every 2 s while a transmission is detected.
+static void reportTransmission(bool force) {
+    static bool lastValid = false;
+    static int lastKHz = 0, lastSr = 0;
+    static uint32_t lastPrint = 0;
+    const uint32_t now = millis();
+    const bool changed = transmissionCenterValid != lastValid
+        || (transmissionCenterValid && (transmissionCenterKHz != lastKHz
+                                        || transmissionSymbolRateKsps != lastSr));
+    if (!force && !(changed && now - lastPrint >= 500)
+        && !(transmissionCenterValid && now - lastPrint >= 2000)) return;
+    if (transmissionCenterValid)
+        Serial.printf("[cf] %d.%03d MHz sr=%d ksps\n", transmissionCenterKHz / 1000,
+                      transmissionCenterKHz % 1000, transmissionSymbolRateKsps);
+    else
+        Serial.println("[cf] none");
+    lastValid = transmissionCenterValid;
+    lastKHz = transmissionCenterKHz;
+    lastSr = transmissionSymbolRateKsps;
+    lastPrint = now;
+}
+
 // Draw once: this strip is outside the trace and waterfall repaint regions.
 static void drawTransmissionCenterLabel() {
     char centerLabel[24], rateLabel[24], label[48];
-    if (transmissionCenterValid)
+    if (viewWide) {
+        snprintf(centerLabel, sizeof(centerLabel), "%d MHz", viewLowMHz);
+        snprintf(rateLabel, sizeof(rateLabel), "%d MHz", viewHighMHz);
+    } else if (transmissionCenterValid)
         snprintf(centerLabel, sizeof(centerLabel), "CF = %d.%03d MHz",
                  transmissionCenterKHz / 1000, transmissionCenterKHz % 1000);
     else
         snprintf(centerLabel, sizeof(centerLabel), "CF = --- MHz");
-    if (transmissionCenterValid)
+    if (viewWide) {
+    } else if (transmissionCenterValid)
         snprintf(rateLabel, sizeof(rateLabel), "SR est. %d ksps", transmissionSymbolRateKsps);
     else
         snprintf(rateLabel, sizeof(rateLabel), "SR = --- ksps");
@@ -459,21 +525,29 @@ static void drawSpectrumTrace(int width, int right) {
     }
 }
 
+static char lastStatus[64] = {};
+
 static void drawFrame(const SpectrumFrame& frame) {
     const int right = tft.width() - 6, width = right - kPlotLeft;
     static int lastGain = -1;
     static bool lastFilter = false;
-    if (!frame.valid || frame.gain != lastGain || frame.burstFiltered != lastFilter) {
+    static bool lastWide = false;
+    if (!frame.valid || frame.gain != lastGain || frame.burstFiltered != lastFilter
+        || frame.wide != lastWide) {
         smoothPrimed = false;
         memset(waterfall, 0, sizeof(waterfall));
     }
     lastGain = frame.gain;
     lastFilter = frame.burstFiltered;
+    lastWide = frame.wide;
+    if (frame.valid) { viewWide = frame.wide; viewLowMHz = frame.lowMHz; viewHighMHz = frame.highMHz; }
     char status[64];
     if (!frame.valid) snprintf(status, sizeof(status), "%s", frame.error);
     else if (frame.clipped) snprintf(status, sizeof(status), "CLIPPING (gain %u)", frame.gain);
+    else if (frame.wide)
+        snprintf(status, sizeof(status), "SWEEP %d-%d MHz | %d kHz/bin", frame.lowMHz, frame.highMHz,
+                 (frame.highMHz - frame.lowMHz) * 1000 / kSpectrumBins);
     else snprintf(status, sizeof(status), "%d bins | 31.25 kHz spacing", kSpectrumBins);
-    static char lastStatus[64] = {};
     static uint16_t lastStatusColor = 0;
     const uint16_t statusColor = frame.valid && !frame.clipped ? color::MID : color::ERROR;
     if (strcmp(status, lastStatus) || statusColor != lastStatusColor) {
@@ -491,7 +565,10 @@ static void drawFrame(const SpectrumFrame& frame) {
     if (frame.valid)
         updateAutoScale(smooth, spectrumBinForPixel(0, width),
                         spectrumBinForPixel(width - 1, width));
-    if (frame.valid)
+    if (frame.valid && frame.wide) {
+        transmissionCenterValid = false;
+        reportPeak(frame);
+    } else if (frame.valid)
         updateTransmissionCenter(smooth, spectrumBinForPixel(0, width),
                                  spectrumBinForPixel(width - 1, width));
     else if (transmissionCenterValid
@@ -499,6 +576,7 @@ static void drawFrame(const SpectrumFrame& frame) {
         transmissionCenterValid = false;
     }
     drawTransmissionCenterLabel();
+    if (!frame.wide) reportTransmission(false);
     if (plotHeight > 0) drawSpectrumTrace(width, right);
 
     memcpy(waterfall[waterfallHead], frame.bins, sizeof(frame.bins));
@@ -521,18 +599,92 @@ static void drawFrame(const SpectrumFrame& frame) {
     }
 }
 
+static volatile bool gRxRunning = true;
+
+// Stepped sweep: 12 MHz windows of 16 MHz captures, stitched and max-resampled to 512 bins.
+static bool acquireWide(SpectrumProcessor& proc, uint32_t* samples, SpectrumFrame& frame,
+                        int lowMHz, int highMHz, uint32_t& captureUs) {
+    // Heap, not .bss: static DRAM is full on the classic ESP32.
+    static uint8_t* src = (uint8_t*)malloc(kSweepMaxWindows * kSweepWindowBins);
+    static SpectrumFrame* tmpFrame = new SpectrumFrame();
+    if (!src || !tmpFrame) return false;
+    SpectrumFrame& tmp = *tmpFrame;
+    const int spanKHz = (highMHz - lowMHz) * 1000;
+    const int windows = (spanKHz + kSweepStepKHz - 1) / kSweepStepKHz;
+    if (windows > kSweepMaxWindows) return false;
+    uint32_t clipped = 0;
+    for (int k = 0; k < windows; ++k) {
+        const int centerMHz = lowMHz + kSweepStepKHz / 2000 + k * (kSweepStepKHz / 1000);
+        if (!espSdrSetFrequencyMHz(centerMHz)) return false;
+        if (!espSdrAcquireBurst(samples, kSpectrumBins, kCaptureClock, &captureUs)) return false;
+        proc.process(samples, tmp);
+        clipped += tmp.clipped;
+        // Usable window: the central 384 bins (fft-shifted index 64..447).
+        memcpy(&src[k * kSweepWindowBins], &tmp.bins[(kSpectrumBins - kSweepWindowBins) / 2],
+               kSweepWindowBins);
+    }
+    const int total = windows * kSweepWindowBins;
+    for (int j = 0; j < kSpectrumBins; ++j) {
+        // 31.25 kHz source bins covered by display bin j.
+        int s0 = (int)((int64_t)j * spanKHz * 32 / (1000 * kSpectrumBins));
+        int s1 = (int)(((int64_t)(j + 1) * spanKHz * 32 + 1000 * kSpectrumBins - 1)
+                       / (1000 * kSpectrumBins));
+        if (s1 <= s0) s1 = s0 + 1;
+        if (s1 > total) s1 = total;
+        if (s0 >= total) s0 = total - 1;
+        uint8_t peak = 0;
+        for (int i = s0; i < s1; ++i) if (src[i] > peak) peak = src[i];
+        frame.bins[j] = peak;
+    }
+    frame.valid = true;
+    frame.wide = true;
+    frame.lowMHz = lowMHz;
+    frame.highMHz = highMHz;
+    frame.clipped = clipped > 65535 ? 65535 : (uint16_t)clipped;
+    frame.burstFiltered = false;
+    frame.error[0] = '\0';
+    return true;
+}
+
 static void receiverTask(void*) {
-    static SpectrumProcessor processor;
+    // Heap, not .bss: static DRAM is full (FFT tables + burst history are ~28 KB).
+    static SpectrumProcessor* processorHeap = new SpectrumProcessor();
+    SpectrumProcessor& processor = *processorHeap;
     static uint32_t samples[kSpectrumBins];
     int appliedGain = -1;
     bool tuned = false;
+    int appliedCenterMHz = -1;
     for (;;) {
         SpectrumFrame frame;
+        if (!gRxRunning) {
+            tuned = false;          // Wi-Fi may be re-initialised while stopped
+            appliedGain = -1;
+            appliedCenterMHz = -1;
+            snprintf(frame.error, sizeof(frame.error), "STOPPED (start = resume)");
+            xQueueOverwrite(frameQueue, &frame);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        const int rangeMode = gRangeMode;
         processor.setBurstFilterEnabled(burstFilterEnabled);
+        processor.setRawMode(rangeMode != kRangeNarrow);
+        espSdrSetQuiet(rangeMode != kRangeNarrow);
         bool configured = espSdrReady();
-        if (configured && !tuned) tuned = espSdrSetFrequencyMHz(kCaptureCenterMHz);
+        const int wantedCenterMHz = gCaptureCenterMHz;
+        if (rangeMode != kRangeNarrow) {
+            tuned = true;           // the sweep tunes every window itself
+            appliedCenterMHz = -1;  // force a retune when returning to narrow mode
+        } else if (configured && (!tuned || wantedCenterMHz != appliedCenterMHz)) {
+            tuned = espSdrSetFrequencyMHz(wantedCenterMHz);
+            appliedCenterMHz = wantedCenterMHz;
+            processor.reset();
+        }
         configured = configured && tuned;
         const uint8_t gain = appliedReceiverGain;
+        if (configured && rangeMode != kRangeNarrow && appliedGain < 0) {
+            // the gain registers need one tuned window before they are programmed
+            configured = espSdrSetFrequencyMHz(kCaptureCenterMHz);
+        }
         if (configured && gain != appliedGain) {
             configured = espSdrSetGain(gain) && espSdrSetAgc(false);
             if (configured) {
@@ -542,7 +694,13 @@ static void receiverTask(void*) {
         }
         frame.gain = appliedGain < 0 ? gain : (uint8_t)appliedGain;
         uint32_t captureUs = 0;
-        if (configured && espSdrAcquireBurst(samples, kSpectrumBins, kCaptureClock, &captureUs)) {
+        if (configured && rangeMode != kRangeNarrow
+            && acquireWide(processor, samples, frame,
+                           rangeMode == kRangeWlan ? kWlanLowMHz : kMaxLowMHz,
+                           rangeMode == kRangeWlan ? kWlanHighMHz : kMaxHighMHz, captureUs)) {
+            // wide frame complete
+        } else if (configured && rangeMode == kRangeNarrow
+                   && espSdrAcquireBurst(samples, kSpectrumBins, kCaptureClock, &captureUs)) {
             processor.process(samples, frame);
         } else {
             processor.reset();
@@ -595,11 +753,301 @@ static void singleTapAction(int y) {
     else cycleTraceMode();
 }
 
+static constexpr int kFreqMinMHz = 2300, kFreqMaxMHz = 2500;
+constexpr uint32_t kReleaseHoldMs = 100;
 // A double tap toggles combined/full-spectrum layout; a single tap changes the
 // style of the part it hits.
 constexpr uint32_t kDoubleTapMs = 350;
 // Contact counts as continuous across short pressure dropouts of the panel.
-constexpr uint32_t kReleaseHoldMs = 100;
+
+static void drawHeader();
+
+// Software "BOOT button": the ROM loader reads this RTC flag after the reset and stays
+// in serial download mode, so esptool can flash without touching the board.
+static void rebootToBootloader() {
+    tft.fillScreen(color::BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(color::BRIGHT, color::BG);
+    tft.drawString("DOWNLOAD MODE", tft.width() / 2, tft.height() / 2 - 12, 4);
+    tft.setTextColor(color::MID, color::BG);
+    tft.drawString("ready to flash (USB)", tft.width() / 2, tft.height() / 2 + 20, 2);
+    Serial.println("[sys] rebooting into download mode");
+    Serial.flush();
+    delay(150);
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);   // harmless on the classic ESP32
+    // The classic ESP32 ROM samples the GPIO0 strapping pin: hold it low across the reset.
+    rtc_gpio_init(GPIO_NUM_0);
+    rtc_gpio_set_direction(GPIO_NUM_0, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_set_level(GPIO_NUM_0, 0);
+    rtc_gpio_hold_en(GPIO_NUM_0);
+    // A plain esp_restart() releases the hold; the pad hold survives deep sleep, so wake
+    // up from a short deep sleep and the ROM sees GPIO0 low at reset.
+    esp_sleep_enable_timer_wakeup(300 * 1000);
+    esp_deep_sleep_start();
+}
+
+// ---------------------------------------------------------------- menu + web
+// MENU button (top right): stops the receiver, releases the radio and opens the
+// settings screen. A small web server (Wi-Fi AP) is only up while this screen is open.
+static bool menuOpen = false;
+static int menuMode = kRangeNarrow, menuCenter = kCaptureCenterMHz;
+static WebServer* webServer = nullptr;
+static bool webStartRequested = false;
+static bool webUp = false;
+static char webInfo[80] = "Web server not available";
+static const char* const kApSsid = "CYD-SPEC";
+static const char* const kApPass = "cyd-spec-1";
+
+struct MenuButton { int x, y, w, h; const char* label; };
+static MenuButton menuButtons[10];
+static int menuButtonCount = 0;
+
+static const char* modeName(int mode) {
+    return mode == kRangeWlan ? "WLAN 2400-2484" : mode == kRangeMax ? "MAX 2300-2500" : "CENTRE";
+}
+
+static void drawMenuButton(const MenuButton& b, bool selected, uint16_t fill) {
+    tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, selected ? color::MID : fill);
+    tft.drawRoundRect(b.x, b.y, b.w, b.h, 6, color::BRIGHT);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(selected ? color::BG : color::BRIGHT, selected ? color::MID : fill);
+    tft.drawString(b.label, b.x + b.w / 2, b.y + b.h / 2, tft.textWidth(b.label, 2) < b.w - 6 ? 2 : 1);
+}
+
+static void drawMenu() {
+    const int W = tft.width(), H = tft.height();
+    tft.fillScreen(color::BG);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(color::BRIGHT, color::BG);
+    tft.drawString("SETTINGS - receiver stopped", W / 2, 2, 2);
+    const int g = 6;
+    const int bw = (W - 4 * g) / 3;
+    const int rowH = H * 17 / 100;
+    int n = 0;
+    const int y1 = H * 14 / 100;
+    menuButtons[n++] = {g, y1, bw, rowH, "QO-100"};
+    menuButtons[n++] = {2 * g + bw, y1, bw, rowH, "WLAN"};
+    menuButtons[n++] = {3 * g + 2 * bw, y1, bw, rowH, "MAX"};
+    const int y2 = H * 44 / 100;
+    const int sw = (W - 5 * g) / 4;
+    menuButtons[n++] = {g, y2, sw, rowH, "-10"};
+    menuButtons[n++] = {2 * g + sw, y2, sw, rowH, "-1"};
+    menuButtons[n++] = {3 * g + 2 * sw, y2, sw, rowH, "+1"};
+    menuButtons[n++] = {4 * g + 3 * sw, y2, sw, rowH, "+10"};
+    const int sw2 = (W - 3 * g) * 62 / 100;
+    menuButtons[n++] = {g, H * 76 / 100, sw2, H * 22 / 100, "START"};
+    menuButtons[n++] = {2 * g + sw2, H * 76 / 100, W - 3 * g - sw2, H * 22 / 100, "FLASH"};
+    menuButtonCount = n;
+    drawMenuButton(menuButtons[0], menuMode == kRangeNarrow && menuCenter == kCaptureCenterMHz, color::DIM);
+    drawMenuButton(menuButtons[1], menuMode == kRangeWlan, color::DIM);
+    drawMenuButton(menuButtons[2], menuMode == kRangeMax, color::DIM);
+    for (int i = 3; i < 7; ++i) drawMenuButton(menuButtons[i], false, color::DIM);
+    drawMenuButton(menuButtons[7], false, color::rgb(0, 110, 40));
+    drawMenuButton(menuButtons[8], false, color::rgb(120, 60, 0));
+    char line[64];
+    if (menuMode == kRangeNarrow) snprintf(line, sizeof(line), "Centre %d MHz (16 MHz window)", menuCenter);
+    else snprintf(line, sizeof(line), "Sweep: %s MHz", modeName(menuMode));
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(color::BRIGHT, color::BG);
+    tft.fillRect(0, y2 - 22, W, 20, color::BG);
+    tft.drawString(line, W / 2, y2 - 20, 2);
+    tft.setTextColor(color::MID, color::BG);
+    tft.drawString(webInfo, W / 2, H * 66 / 100, 1);
+}
+
+static void webHandleRoot() {
+    char page[1100];
+    snprintf(page, sizeof(page),
+        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>CYD Spectrum</title><body style='font-family:sans-serif;max-width:22em;margin:1em auto'>"
+        "<h3>QO-100 Spectrum Viewer</h3><p>Receiver stopped.<br>Now: %s, centre %d MHz</p>"
+        "<form action=/start><p>Mode <select name=m>"
+        "<option value=0%s>Centre (16 MHz window)</option>"
+        "<option value=1%s>WLAN 2400-2484</option>"
+        "<option value=2%s>MAX 2300-2500</option></select></p>"
+        "<p>Centre MHz <input name=cf type=number min=2300 max=2500 value=%d></p>"
+        "<p><button style='font-size:1.5em;padding:.4em 1.2em'>START</button></p></form>"
+        "<p><a href=/update>Firmware update</a></p>",
+        modeName(menuMode), menuCenter,
+        menuMode == 0 ? " selected" : "", menuMode == 1 ? " selected" : "",
+        menuMode == 2 ? " selected" : "", menuCenter);
+    webServer->send(200, "text/html", page);
+}
+
+// Firmware update over the web page: POST the .bin built by PlatformIO (firmware.bin).
+static void webHandleUpdatePage() {
+    webServer->send(200, "text/html",
+        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<body style='font-family:sans-serif;max-width:22em;margin:1em auto'><h3>Firmware update</h3>"
+        "<form method=POST action=/update enctype=multipart/form-data>"
+        "<p><input type=file name=fw accept=.bin required></p>"
+        "<p><button style='font-size:1.3em'>Upload</button></p></form>"
+        "<p>Receiver restarts after a successful update.</p>");
+}
+
+static void webHandleUpdateDone() {
+    const bool ok = !Update.hasError();
+    webServer->send(200, "text/plain", ok ? "Update OK, restarting ..." : "Update FAILED");
+    delay(600);
+    if (ok) ESP.restart();
+}
+
+static void webHandleUpdateUpload() {
+    HTTPUpload& up = webServer->upload();
+    if (up.status == UPLOAD_FILE_START) {
+        Serial.printf("[ota] start %s\n", up.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
+    } else if (up.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) Serial.printf("[ota] done, %u bytes\n", (unsigned)up.totalSize);
+        else Update.printError(Serial);
+    }
+}
+
+static void webHandleStart() {
+    if (webServer->hasArg("m")) {
+        const int m = webServer->arg("m").toInt();
+        if (m >= kRangeNarrow && m <= kRangeMax) menuMode = m;
+    }
+    if (webServer->hasArg("cf")) {
+        const int cf = webServer->arg("cf").toInt();
+        if (cf >= kFreqMinMHz && cf <= kFreqMaxMHz) menuCenter = cf;
+    }
+    webServer->send(200, "text/html",
+        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<body style='font-family:sans-serif'><h3>Started</h3><p>Receiver running, Wi-Fi is off now.</p>");
+    webStartRequested = true;
+}
+
+static void enterMenu() {
+    if (menuOpen) return;
+    gRxRunning = false;
+    delay(250);                       // let the receiver task finish its burst
+    espSdrEnd();
+    menuMode = gRangeMode;
+    menuCenter = gCaptureCenterMHz;
+    webUp = false;
+    webStartRequested = false;
+    // Home network first (credentials saved with the "wifi" serial command), own AP as fallback.
+    char ssid[40] = {}, pass[72] = {};
+    {
+        Preferences wifiCfg;
+        if (wifiCfg.begin("shcfg", true)) {
+            wifiCfg.getString("ssid", ssid, sizeof(ssid));
+            wifiCfg.getString("pass", pass, sizeof(pass));
+            wifiCfg.end();
+        }
+    }
+    bool station = false;
+    if (ssid[0]) {
+        tft.fillScreen(color::BG);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(color::BRIGHT, color::BG);
+        tft.drawString("Connecting to Wi-Fi ...", tft.width() / 2, tft.height() / 2, 2);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssid, pass);
+        for (int i = 0; i < 100 && WiFi.status() != WL_CONNECTED; ++i) delay(100);
+        station = WiFi.status() == WL_CONNECTED;
+        if (!station) {
+            Serial.printf("[menu] could not join '%s', falling back to own access point\n", ssid);
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            delay(100);
+        }
+    }
+    if (station || (WiFi.mode(WIFI_AP) && WiFi.softAP(kApSsid, kApPass))) {
+        webServer = new WebServer(80);
+        webServer->on("/", webHandleRoot);
+        webServer->on("/start", webHandleStart);
+        webServer->on("/update", HTTP_GET, webHandleUpdatePage);
+        webServer->on("/update", HTTP_POST, webHandleUpdateDone, webHandleUpdateUpload);
+        webServer->begin();
+        webUp = true;
+        if (station) {
+            snprintf(webInfo, sizeof(webInfo), "Web: http://%s/  (%s)",
+                     WiFi.localIP().toString().c_str(), ssid);
+        } else {
+            snprintf(webInfo, sizeof(webInfo), "Web: Wi-Fi %s pw %s http://192.168.4.1", kApSsid, kApPass);
+        }
+        Serial.printf("[menu] %s (free heap %u)\n", webInfo, (unsigned)ESP.getFreeHeap());
+    } else {
+        snprintf(webInfo, sizeof(webInfo), "Web server not available");
+        Serial.println("[menu] web server could not start");
+    }
+    menuOpen = true;
+    drawMenu();
+}
+
+static void exitMenu() {
+    if (webServer) {
+        webServer->stop();
+        delete webServer;
+        webServer = nullptr;
+    }
+    if (webUp) {
+        WiFi.softAPdisconnect(true);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        webUp = false;
+        delay(100);
+    }
+    const bool ok = espSdrBegin();
+    Serial.printf("[menu] receiver %s, mode %s, centre %d MHz\n", ok ? "restarted" : "RESTART FAILED",
+                  modeName(menuMode), menuCenter);
+    gCaptureCenterMHz = menuCenter;
+    gRangeMode = menuMode;
+    menuOpen = false;
+    memset(lastStatus, 0, sizeof(lastStatus));
+    drawHeader();
+    applyLayout();
+    gRxRunning = true;
+}
+
+static void menuTapped(int x, int y) {
+    for (int i = 0; i < menuButtonCount; ++i) {
+        const MenuButton& b = menuButtons[i];
+        if (x < b.x || x >= b.x + b.w || y < b.y || y >= b.y + b.h) continue;
+        if (i == 0) { menuMode = kRangeNarrow; menuCenter = kCaptureCenterMHz; }
+        else if (i == 1) menuMode = kRangeWlan;
+        else if (i == 2) menuMode = kRangeMax;
+        else if (i >= 3 && i <= 6) {
+            static const int steps[4] = {-10, -1, 1, 10};
+            menuCenter += steps[i - 3];
+            if (menuCenter < kFreqMinMHz) menuCenter = kFreqMinMHz;
+            if (menuCenter > kFreqMaxMHz) menuCenter = kFreqMaxMHz;
+            menuMode = kRangeNarrow;
+        } else if (i == 8) { rebootToBootloader(); return; }
+        else { exitMenu(); return; }
+        drawMenu();
+        return;
+    }
+}
+
+static void handleMenu() {
+    if (webUp && webServer) webServer->handleClient();
+    if (webStartRequested) {
+        webStartRequested = false;
+        delay(300);                   // let the browser receive the reply
+        exitMenu();
+        return;
+    }
+    static bool wasTouched = false;
+    static uint32_t lastPoll = 0, lastContact = 0, lastTap = 0;
+    static int lastX = 0, lastY = 0;
+    const uint32_t now = millis();
+    if ((uint32_t)(now - lastPoll) < 15) return;
+    lastPoll = now;
+    int x = 0, y = 0;
+    if (touchRead(x, y)) { lastContact = now; lastX = x; lastY = y; }
+    const bool touched = (uint32_t)(now - lastContact) < kReleaseHoldMs;
+    if (touched && !wasTouched && (uint32_t)(now - lastTap) > 250) {
+        lastTap = now;
+        menuTapped(lastX, lastY);
+    }
+    wasTouched = touched;
+}
+
 
 static void handleModeInput() {
     static bool wasTouched = false, pending = false;
@@ -614,12 +1062,18 @@ static void handleModeInput() {
     lastPoll = now;
 
     int x = 0, y = 0;
-    if (touchRead(x, y)) lastContact = now;
+    static int lastX = 0, lastY = 0;
+    if (touchRead(x, y)) { lastContact = now; lastX = x; lastY = y; }
     const bool touched = (uint32_t)(now - lastContact) < kReleaseHoldMs;
     bool tap = false;
     int tapY = 0;
     if (touched && !wasTouched && (uint32_t)(now - lastDown) > 80) {
         lastDown = now;
+        if (lastX >= tft.width() - 64 && lastY < 36) {   // MENU corner button
+            wasTouched = touched;
+            enterMenu();
+            return;
+        }
         tap = y >= kPlotTop;
         tapY = y;
     }
@@ -636,8 +1090,9 @@ static void handleModeInput() {
     wasTouched = touched;
 }
 
+
 static void handleSerial() {
-    static char line[48];
+    static char line[120];
     static size_t used = 0;
     static bool overflow = false;
     while (Serial.available()) {
@@ -648,6 +1103,94 @@ static void handleSerial() {
                 if (!strcmp(line, "burst 0") || !strcmp(line, "burst 1")) {
                     burstFilterEnabled = line[6] == '1';
                     Serial.printf("[rx] burst filter %s\n", burstFilterEnabled ? "ON" : "OFF");
+                    used = 0;
+                    continue;
+                }
+                if (!strncmp(line, "freq ", 5)) {
+                    const long mhz = atol(line + 5);
+                    if (mhz >= kFreqMinMHz && mhz <= kFreqMaxMHz) {
+                        gCaptureCenterMHz = (int)mhz;
+                        gRangeMode = kRangeNarrow;
+                        Serial.printf("[rx] centre frequency -> %ld MHz\n", mhz);
+                    } else {
+                        Serial.printf("[rx] freq out of range (%d..%d MHz)\n", kFreqMinMHz, kFreqMaxMHz);
+                    }
+                    used = 0;
+                    continue;
+                }
+                if (!strncmp(line, "wifi ", 5) || !strcmp(line, "wifi")) {
+                    // wifi <ssid> <password>  |  wifi clear  |  wifi (show saved SSID only)
+                    Preferences wifiCfg;
+                    if (!wifiCfg.begin("shcfg", false)) {
+                        Serial.println("[wifi] ERROR: could not open settings");
+                    } else if (!strcmp(line, "wifi")) {
+                        Serial.printf("[wifi] saved SSID: '%s'\n", wifiCfg.getString("ssid", "").c_str());
+                    } else if (!strcmp(line, "wifi clear")) {
+                        wifiCfg.remove("ssid");
+                        wifiCfg.remove("pass");
+                        Serial.println("[wifi] credentials removed (menu uses its own access point)");
+                    } else {
+                        char* ssidArg = line + 5;
+                        char* passArg = strchr(ssidArg, ' ');
+                        if (passArg) *passArg++ = '\0';
+                        wifiCfg.putString("ssid", ssidArg);
+                        wifiCfg.putString("pass", passArg ? passArg : "");
+                        Serial.printf("[wifi] saved SSID '%s' (password stored)\n", ssidArg);
+                    }
+                    wifiCfg.end();
+                    used = 0;
+                    continue;
+                }
+                if (!strcmp(line, "bootloader")) {
+                    rebootToBootloader();
+                }
+                if (!strcmp(line, "maxrange") || !strcmp(line, "rangewlan") || !strcmp(line, "qo100")) {
+                    if (line[0] == 'm') gRangeMode = kRangeMax;
+                    else if (line[0] == 'r') gRangeMode = kRangeWlan;
+                    else { gRangeMode = kRangeNarrow; gCaptureCenterMHz = kCaptureCenterMHz; }
+                    Serial.printf("[rx] range: %s\n", line);
+                    used = 0;
+                    continue;
+                }
+                if (!strcmp(line, "stop") || !strcmp(line, "start")) {
+                    gRxRunning = line[2] == 'a';
+                    Serial.printf("[rx] %s\n", gRxRunning ? "started" : "stopped");
+                    used = 0;
+                    continue;
+                }
+                if (!strncmp(line, "calref ", 7)) {
+                    // Reference frequency of the transmitter in MHz, e.g. calref 2403.750
+                    const int refKHz = (int)lroundf(atof(line + 7) * 1000.0f);
+                    if (transmissionCenterValid && refKHz > 2000000 && refKHz < 3000000) {
+                        calOffsetKHz = refKHz - (transmissionCenterKHz - calOffsetKHz);
+                        saveCalOffset();
+                        Serial.printf("[cf] cal offset %d kHz (saved)\n", (int)calOffsetKHz);
+                    } else {
+                        Serial.println("[cf] calref needs a detected signal and a valid MHz value");
+                    }
+                    used = 0;
+                    continue;
+                }
+                if (!strncmp(line, "cal ", 4)) {
+                    calOffsetKHz = atoi(line + 4);
+                    saveCalOffset();
+                    Serial.printf("[cf] cal offset %d kHz (saved)\n", (int)calOffsetKHz);
+                    used = 0;
+                    continue;
+                }
+                if (!strcmp(line, "cal")) {
+                    Serial.printf("[cf] cal offset %d kHz\n", (int)calOffsetKHz);
+                    used = 0;
+                    continue;
+                }
+                if (!strcmp(line, "status")) {
+                    Serial.printf("[rx] centre frequency: %d MHz\n", gCaptureCenterMHz);
+                    reportTransmission(true);
+                    used = 0;
+                    continue;
+                }
+                if (!strcmp(line, "freq")) {
+                    Serial.printf("[rx] centre frequency: %d MHz\n", gCaptureCenterMHz);
                     used = 0;
                     continue;
                 }
@@ -673,7 +1216,7 @@ static void handleSerial() {
                     used = 0;
                     continue;
                 }
-                Serial.println("Commands: burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
+                Serial.println("Commands: wifi <ssid> <pass> | wifi clear | bootloader (download mode for flashing) | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
                                "wf 0-4 (classic|thermal|phosphor|gray|rainbow) | help");
             }
             used = 0; overflow = false;
@@ -682,7 +1225,32 @@ static void handleSerial() {
     }
 }
 
+// Title block plus the MENU corner button (top right).
+static void drawHeader() {
+    tft.fillScreen(color::BG);
+    const char* const title = "QO-100 Uplink Spectrum Viewer";
+    const int titleFont = tft.textWidth(title, 2) <= tft.width() - 8 ? 2 : 1;
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(color::MID, color::BG);
+    char versionLabel[64];
+    snprintf(versionLabel, sizeof(versionLabel), "Ver. %s", APP_VERSION);
+    tft.drawString(versionLabel, 4, 0, 1);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString("by HB9IIU, extended by DG7NDV", tft.width() - 34, 0, 1);   // left of the MENU button
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(color::BRIGHT, color::BG);
+    tft.drawString(title, tft.width() / 2, kTitleY, titleFont);
+    tft.fillRoundRect(tft.width() - 30, 0, 30, 22, 4, color::DIM);
+    tft.drawRoundRect(tft.width() - 30, 0, 30, 22, 4, color::MID);
+    tft.setTextColor(color::BRIGHT, color::DIM);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("=", tft.width() - 15, 11, 4);
+}
+
 void setup() {
+    // Release a GPIO0 hold left over from "bootloader" (only matters if download mode did not engage).
+    rtc_gpio_hold_dis(GPIO_NUM_0);
+    rtc_gpio_deinit(GPIO_NUM_0);
     Serial.begin(115200);
     delay(200);
     Serial.println("\n[rx] QO-100 DATV spectrum/waterfall");
@@ -698,6 +1266,7 @@ void setup() {
         const uint8_t savedWaterfallStyle = settings.getUChar("wf", kWfClassic);
         if (savedTraceMode < kTraceModeCount) traceMode = savedTraceMode;
         if (savedWaterfallStyle < kWfStyleCount) waterfallStyle = savedWaterfallStyle;
+        calOffsetKHz = settings.getInt("calkhz", 0);
         settings.end();
     }
     if (rotation > 3) rotation = 1;
@@ -721,23 +1290,14 @@ void setup() {
                   (tft.height() - kSplashHeight) / 2,
                   kSplashWidth, kSplashHeight, kSplashImage);
     tft.setSwapBytes(false);
+    tft.setTextDatum(BC_DATUM);
+    tft.setTextColor(color::BRIGHT);
+    tft.drawString("extended by DG7NDV", tft.width() / 2, tft.height() - 2, 2);
     delay(5000);
     tft.setRotation(rotation);
     rotation = touchBegin(tft, rotation, tft.width(), tft.height());
     tft.setRotation(rotation);
-    tft.fillScreen(color::BG);
-    const char* const title = "QO-100 Uplink Spectrum Viewer";
-    const int titleFont = tft.textWidth(title, 2) <= tft.width() - 8 ? 2 : 1;
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(color::MID, color::BG);
-    char versionLabel[24];
-    snprintf(versionLabel, sizeof(versionLabel), "Ver. %s", APP_VERSION);
-    tft.drawString(versionLabel, 4, 0, 1);
-    tft.setTextDatum(TR_DATUM);
-    tft.drawString("by HB9IIU", tft.width() - 4, 0, 1);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(color::BRIGHT, color::BG);
-    tft.drawString(title, tft.width() / 2, kTitleY, titleFont);
+    drawHeader();
     tft.setTextColor(color::MID, color::BG);
     tft.drawString("RX starting", tft.width() / 2, kStatusY, 1);
     applyLayout();
@@ -761,6 +1321,12 @@ void setup() {
 }
 
 void loop() {
+    if (menuOpen) {
+        handleMenu();
+        handleSerial();
+        delay(5);
+        return;
+    }
     handleModeInput();
     handleSerial();
     SpectrumFrame frame;

@@ -161,6 +161,15 @@ bool espSdrBegin() {
     return true;
 }
 
+void espSdrEnd() {
+    g_ready = false;
+    g_directTuned = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    Serial.println("[sdr] stopped, Wi-Fi released");
+}
+
 uint8_t espSdrGainMax() { return g_gainMax; }
 bool    espSdrReady()   { return g_ready; }
 
@@ -193,10 +202,13 @@ bool espSdrSetGain(uint8_t gain) {
     return true;
 }
 
+static bool g_quiet = false;
+void espSdrSetQuiet(bool quiet) { g_quiet = quiet; }
+
 bool espSdrSetFrequencyMHz(uint32_t mhz) {
     if (!g_ready) return false;
-    // This application only targets the 2.4 GHz receive path.
-    if (mhz < 2400 || mhz > 2484) {
+    // Software limit only (receive path); sweep windows reach 2300..2500 MHz.
+    if (mhz < 2290 || mhz > 2510) {
         g_lastError = "RX frequency out of range";
         g_errorDetail = mhz;
         return false;
@@ -208,7 +220,7 @@ bool espSdrSetFrequencyMHz(uint32_t mhz) {
     g_frequencyMHz = mhz;
     g_directTuned = true;
     prepare_rx();
-    Serial.printf("[sdr] direct receive tune requested: %lu MHz (RF verification required)\n",
+    if (!g_quiet) Serial.printf("[sdr] direct receive tune requested: %lu MHz (RF verification required)\n",
                   (unsigned long)mhz);
     return true;
 }

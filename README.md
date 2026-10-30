@@ -1,3 +1,5 @@
+> **Extended fork by DG7NDV** — tunable 2300–2500 MHz receive range, wide sweep views, touch menu, web page and extra serial commands. See **[EXTENDED.md](EXTENDED.md)**. The browser installer below installs the original HB9IIU firmware.
+
 > **[Flash Pocket QO-100 Spectrum Viewer in your browser](https://hb9iiu.github.io/ESP32-CYD-pocket-qo-100-spectrum-viewer/)** — choose the 2.8-inch or 4-inch Classic ESP32 CYD installer; Chrome or Edge required.
 
 # Pocket QO-100 Spectrum Viewer

@@ -9,11 +9,16 @@ int signed10(uint32_t value) {
 }
 }
 
+volatile int gCaptureCenterMHz = kCaptureCenterMHz;
+volatile int gRangeMode = kRangeNarrow;
+
 int spectrumBinForPixel(int pixel, int width) {
     if (width < 2) return 0;
-    const int frequency = kBandLowKHz
-        + pixel * (kBandHighKHz - kBandLowKHz) / (width - 1);
-    int bin = ((frequency - kCaptureLowKHz) * kSpectrumBins
+    if (gRangeMode != kRangeNarrow)   // wide frames already span the whole view
+        return (pixel * (kSpectrumBins - 1) + (width - 1) / 2) / (width - 1);
+    const int frequency = bandLowKHz()
+        + pixel * (bandHighKHz() - bandLowKHz()) / (width - 1);
+    int bin = ((frequency - captureLowKHz()) * kSpectrumBins
                + kCaptureSpanKHz / 2) / kCaptureSpanKHz;
     if (bin < 0) bin = 0;
     if (bin >= kSpectrumBins) bin = kSpectrumBins - 1;
@@ -34,6 +39,12 @@ void SpectrumProcessor::reset() {
     primed_ = false;
     historyHead_ = 0;
     historyCount_ = 0;
+}
+
+void SpectrumProcessor::setRawMode(bool raw) {
+    if (raw == raw_) return;
+    raw_ = raw;
+    reset();
 }
 
 void SpectrumProcessor::setBurstFilterEnabled(bool enabled) {
@@ -84,10 +95,11 @@ void SpectrumProcessor::process(const uint32_t* samples, SpectrumFrame& frame) {
     fft();
     const float windowSum = (kSpectrumBins - 1) * 0.5f;
     const float norm = 512.0f * 512.0f * windowSum * windowSum;
-    if (burstFilterEnabled_ && historyCount_ < kBurstFilterFrames) ++historyCount_;
+    const bool useBurst = burstFilterEnabled_ && !raw_;
+    if (useBurst && historyCount_ < kBurstFilterFrames) ++historyCount_;
     for (int i = 0; i < kSpectrumBins; ++i) {
         float power = (re_[i] * re_[i] + im_[i] * im_[i]) / norm;
-        if (burstFilterEnabled_) {
+        if (useBurst) {
             history_[historyHead_][i] = power;
             float ordered[kBurstFilterFrames];
             for (int j = 0; j < historyCount_; ++j) {
@@ -102,7 +114,7 @@ void SpectrumProcessor::process(const uint32_t* samples, SpectrumFrame& frame) {
             // Lower middle during even-length startup; no zero-filled history.
             power = ordered[(historyCount_ - 1) / 2];
         }
-        if (!primed_) power_[i] = power;
+        if (!primed_ || raw_) power_[i] = power;
         else power_[i] += kPowerAverageAlpha * (power - power_[i]);
         const float dbfs = 10.0f * log10f(fmaxf(power_[i], 1e-10f));
         int code = (int)((dbfs + 100.0f) * 255.0f / 100.0f);
@@ -110,11 +122,11 @@ void SpectrumProcessor::process(const uint32_t* samples, SpectrumFrame& frame) {
         if (code > 255) code = 255;
         frame.bins[(i + kSpectrumBins / 2) % kSpectrumBins] = (uint8_t)code;
     }
-    if (burstFilterEnabled_) historyHead_ = (historyHead_ + 1) % kBurstFilterFrames;
+    if (useBurst) historyHead_ = (historyHead_ + 1) % kBurstFilterFrames;
     primed_ = true;
     const int dc = kSpectrumBins / 2;
     frame.bins[dc] = (frame.bins[dc - 1] + frame.bins[dc + 1]) / 2;
     frame.valid = true;
-    frame.burstFiltered = burstFilterEnabled_;
+    frame.burstFiltered = useBurst;
     frame.error[0] = '\0';
 }

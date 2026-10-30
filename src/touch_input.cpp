@@ -189,6 +189,7 @@ void loadOrCalibrateFourInchTouch(TFT_eSPI& display, uint8_t& rotation) {
 
 // Idle probe: shows whether the controller answers even while IRQ stays high.
 void logIdleProbe() {
+    return;  // muted: floods the serial port; remove to debug the touch controller
 #ifdef CYD_4INCH
     const uint16_t pressure = touchDisplay->getTouchRawZ();
     uint16_t rawX = 0, rawY = 0;

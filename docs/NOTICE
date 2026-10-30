@@ -28,3 +28,6 @@ Hardware references:
     https://github.com/rzeldent/esp32-smartdisplay
   JustCallMeKoko — ESP32Marauder (AWOK Marauder 6.1)
     https://github.com/justcallmekoko/ESP32Marauder
+
+Modifications (frequency tuning, sweep views, menu/web page, serial commands) by DG7NDV, 2026.
+See EXTENDED.md. Original work by HB9IIU.

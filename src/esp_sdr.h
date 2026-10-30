@@ -5,12 +5,15 @@
 // Original ESP32 only. The capture aperture is reserved before heap startup.
 bool espSdrBegin();
 bool espSdrReady();
+// Shut the Wi-Fi stack down so the normal Arduino Wi-Fi (web menu) can start; espSdrBegin() re-arms RX.
+void espSdrEnd();
 const char* espSdrLastError();
 int32_t espSdrErrorDetail();
 uint8_t espSdrGainMax();
 // Retune between Wi-Fi channel centres. Successful return means configured,
 // not verified PLL lock; an external RF source is needed to verify tuning.
 bool espSdrSetFrequencyMHz(uint32_t mhz);
+void espSdrSetQuiet(bool quiet);   // no log line per retune (used while sweeping)
 bool espSdrSetAgc(bool on);
 bool espSdrSetGain(uint8_t gain);
 
