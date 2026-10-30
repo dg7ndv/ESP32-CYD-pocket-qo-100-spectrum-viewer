@@ -56,10 +56,28 @@ Notes and limits:
   Whether the receiver front end stays sensitive far from the Wi-Fi band was only spot-checked (see below).
 - The frequency is programmed through the ESP32 ROM (`rom_set_rf_freq_offset`) in whole MHz. The firmware only
   reports "tune requested"; it cannot verify PLL lock itself, you need a signal source to verify.
-- Measured with an ESP32-DATV transmitter (DVB-S2 QPSK, 500 kBd / 1 MBd) the viewer showed the carrier
-  centre **about +90 … +110 kHz high**, constant over 2305…2445 MHz (examples: TX 2310.000 → 2310.088,
-  2380.000 → 2380.099, 2403.750 → 2403.857, 2445.000 → 2445.091 MHz). The symbol rate was recognised correctly.
-  Part of this may come from the transmitter's own crystal. Use `cal` / `calref` below to correct the display.
+- Measured with an [ESP32-DATV](https://github.com/SP8ESA/ESP32-DATV) transmitter (DVB-S2, QPSK, 500 kBd,
+  FEC 3/5, test pattern, 22 s per frequency; the viewer centre was set to the nearest MHz with `freq`).
+  The CF reported by the viewer is **about +90 … +110 kHz high**, nearly constant over the whole range:
+
+  | Transmitter (MHz) | Viewer CF (MHz) | Error |
+  |---|---|---|
+  | 2310.000 | 2310.088 | +88 kHz |
+  | 2350.000 | 2350.088 | +88 kHz |
+  | 2380.000 | 2380.099 | +99 kHz |
+  | 2403.750 | 2403.857 | +107 kHz |
+  | 2420.000 | 2420.101 | +101 kHz |
+  | 2445.000 | 2445.091 | +91 kHz |
+
+  The symbol rate was recognised as 500 ksps at every frequency. A constant offset (not proportional to the
+  frequency) points to a fixed offset of the viewer's bin-to-frequency mapping rather than to a crystal error in ppm,
+  but part of it may also come from the transmitter's own crystal. The viewer's resolution is 31.25 kHz per bin.
+
+  **Correction:** `cal <kHz>` adds a fixed correction to the displayed CF (saved in flash), e.g. `cal -95`;
+  `calref 2403.750` sets it automatically while a transmitter of that known frequency is detected. `cal` shows the
+  current value. Storing and reading `cal` was checked on the board; the effect on the CF readout was not verified
+  after the measurements above. Note that a correction tuned on one transmitter also hides that transmitter's own
+  frequency error, so check against a known-good reference when you can.
 
 ## 2. Serial commands (all)
 
