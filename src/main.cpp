@@ -3,9 +3,6 @@
 #include <TFT_eSPI.h>
 #include <Preferences.h>
 #include <stdlib.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <Update.h>
 #include "soc/rtc_cntl_reg.h"
 #include "driver/rtc_io.h"
 #ifndef RTC_CNTL_OPTION1_REG
@@ -789,20 +786,12 @@ static void rebootToBootloader() {
     esp_deep_sleep_start();
 }
 
-// ---------------------------------------------------------------- menu + web
-// MENU button (top right): stops the receiver, releases the radio and opens the
-// settings screen. A small web server (Wi-Fi AP) is only up while this screen is open.
+// ---------------------------------------------------------------- menu
+// MENU button (top right): stops the receiver and opens the settings screen at once.
 static bool menuOpen = false;
 static int menuMode = kRangeNarrow, menuCenter = kCaptureCenterMHz;
-static WebServer* webServer = nullptr;
-static bool webStartRequested = false;
-static bool webUp = false;
-static char webInfo[80] = "Web server not available";
-static const char* const kApSsid = "CYD-SPEC";
-static const char* const kApPass = "cyd-spec-1";
-
 struct MenuButton { int x, y, w, h; const char* label; };
-static MenuButton menuButtons[10];
+static MenuButton menuButtons[8];
 static int menuButtonCount = 0;
 
 static const char* modeName(int mode) {
@@ -838,16 +827,13 @@ static void drawMenu() {
     menuButtons[n++] = {2 * g + sw, y2, sw, rowH, "-1"};
     menuButtons[n++] = {3 * g + 2 * sw, y2, sw, rowH, "+1"};
     menuButtons[n++] = {4 * g + 3 * sw, y2, sw, rowH, "+10"};
-    const int sw2 = (W - 3 * g) * 62 / 100;
-    menuButtons[n++] = {g, H * 76 / 100, sw2, H * 22 / 100, "START"};
-    menuButtons[n++] = {2 * g + sw2, H * 76 / 100, W - 3 * g - sw2, H * 22 / 100, "FLASH"};
+    menuButtons[n++] = {g, H * 72 / 100, W - 2 * g, H * 24 / 100, "START"};
     menuButtonCount = n;
     drawMenuButton(menuButtons[0], menuMode == kRangeNarrow && menuCenter == kCaptureCenterMHz, color::DIM);
     drawMenuButton(menuButtons[1], menuMode == kRangeWlan, color::DIM);
     drawMenuButton(menuButtons[2], menuMode == kRangeMax, color::DIM);
     for (int i = 3; i < 7; ++i) drawMenuButton(menuButtons[i], false, color::DIM);
     drawMenuButton(menuButtons[7], false, color::rgb(0, 110, 40));
-    drawMenuButton(menuButtons[8], false, color::rgb(120, 60, 0));
     char line[64];
     if (menuMode == kRangeNarrow) snprintf(line, sizeof(line), "Centre %d MHz (16 MHz window)", menuCenter);
     else if (menuMode == kRangeCustom)
@@ -857,150 +843,20 @@ static void drawMenu() {
     tft.setTextColor(color::BRIGHT, color::BG);
     tft.fillRect(0, y2 - 22, W, 20, color::BG);
     tft.drawString(line, W / 2, y2 - 20, 2);
-    tft.setTextColor(color::MID, color::BG);
-    tft.drawString(webInfo, W / 2, H * 66 / 100, 1);
-}
-
-static void webHandleRoot() {
-    char page[1100];
-    snprintf(page, sizeof(page),
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>CYD Spectrum</title><body style='font-family:sans-serif;max-width:22em;margin:1em auto'>"
-        "<h3>QO-100 Spectrum Viewer</h3><p>Receiver stopped.<br>Now: %s, centre %d MHz</p>"
-        "<form action=/start><p>Mode <select name=m>"
-        "<option value=0%s>Centre (16 MHz window)</option>"
-        "<option value=1%s>WLAN 2400-2484</option>"
-        "<option value=2%s>MAX 2300-2500</option></select></p>"
-        "<p>Centre MHz <input name=cf type=number min=2300 max=2500 value=%d></p>"
-        "<p><button style='font-size:1.5em;padding:.4em 1.2em'>START</button></p></form>"
-        "<p><a href=/update>Firmware update</a></p>",
-        modeName(menuMode), menuCenter,
-        menuMode == 0 ? " selected" : "", menuMode == 1 ? " selected" : "",
-        menuMode == 2 ? " selected" : "", menuCenter);
-    webServer->send(200, "text/html", page);
-}
-
-// Firmware update over the web page: POST the .bin built by PlatformIO (firmware.bin).
-static void webHandleUpdatePage() {
-    webServer->send(200, "text/html",
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<body style='font-family:sans-serif;max-width:22em;margin:1em auto'><h3>Firmware update</h3>"
-        "<form method=POST action=/update enctype=multipart/form-data>"
-        "<p><input type=file name=fw accept=.bin required></p>"
-        "<p><button style='font-size:1.3em'>Upload</button></p></form>"
-        "<p>Receiver restarts after a successful update.</p>");
-}
-
-static void webHandleUpdateDone() {
-    const bool ok = !Update.hasError();
-    webServer->send(200, "text/plain", ok ? "Update OK, restarting ..." : "Update FAILED");
-    delay(600);
-    if (ok) ESP.restart();
-}
-
-static void webHandleUpdateUpload() {
-    HTTPUpload& up = webServer->upload();
-    if (up.status == UPLOAD_FILE_START) {
-        Serial.printf("[ota] start %s\n", up.filename.c_str());
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
-    } else if (up.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
-    } else if (up.status == UPLOAD_FILE_END) {
-        if (Update.end(true)) Serial.printf("[ota] done, %u bytes\n", (unsigned)up.totalSize);
-        else Update.printError(Serial);
-    }
-}
-
-static void webHandleStart() {
-    if (webServer->hasArg("m")) {
-        const int m = webServer->arg("m").toInt();
-        if (m >= kRangeNarrow && m <= kRangeMax) menuMode = m;
-    }
-    if (webServer->hasArg("cf")) {
-        const int cf = webServer->arg("cf").toInt();
-        if (cf >= kFreqMinMHz && cf <= kFreqMaxMHz) menuCenter = cf;
-    }
-    webServer->send(200, "text/html",
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<body style='font-family:sans-serif'><h3>Started</h3><p>Receiver running, Wi-Fi is off now.</p>");
-    webStartRequested = true;
 }
 
 static void enterMenu() {
     if (menuOpen) return;
     gRxRunning = false;
     delay(250);                       // let the receiver task finish its burst
-    espSdrEnd();
     menuMode = gRangeMode;
     menuCenter = gCaptureCenterMHz;
-    webUp = false;
-    webStartRequested = false;
-    // Home network first (credentials saved with the "wifi" serial command), own AP as fallback.
-    char ssid[40] = {}, pass[72] = {};
-    {
-        Preferences wifiCfg;
-        if (wifiCfg.begin("shcfg", true)) {
-            wifiCfg.getString("ssid", ssid, sizeof(ssid));
-            wifiCfg.getString("pass", pass, sizeof(pass));
-            wifiCfg.end();
-        }
-    }
-    bool station = false;
-    if (ssid[0]) {
-        tft.fillScreen(color::BG);
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(color::BRIGHT, color::BG);
-        tft.drawString("Connecting to Wi-Fi ...", tft.width() / 2, tft.height() / 2, 2);
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(ssid, pass);
-        for (int i = 0; i < 100 && WiFi.status() != WL_CONNECTED; ++i) delay(100);
-        station = WiFi.status() == WL_CONNECTED;
-        if (!station) {
-            Serial.printf("[menu] could not join '%s', falling back to own access point\n", ssid);
-            WiFi.disconnect(true);
-            WiFi.mode(WIFI_OFF);
-            delay(100);
-        }
-    }
-    if (station || (WiFi.mode(WIFI_AP) && WiFi.softAP(kApSsid, kApPass))) {
-        webServer = new WebServer(80);
-        webServer->on("/", webHandleRoot);
-        webServer->on("/start", webHandleStart);
-        webServer->on("/update", HTTP_GET, webHandleUpdatePage);
-        webServer->on("/update", HTTP_POST, webHandleUpdateDone, webHandleUpdateUpload);
-        webServer->begin();
-        webUp = true;
-        if (station) {
-            snprintf(webInfo, sizeof(webInfo), "Web: http://%s/  (%s)",
-                     WiFi.localIP().toString().c_str(), ssid);
-        } else {
-            snprintf(webInfo, sizeof(webInfo), "Web: Wi-Fi %s pw %s http://192.168.4.1", kApSsid, kApPass);
-        }
-        Serial.printf("[menu] %s (free heap %u)\n", webInfo, (unsigned)ESP.getFreeHeap());
-    } else {
-        snprintf(webInfo, sizeof(webInfo), "Web server not available");
-        Serial.println("[menu] web server could not start");
-    }
     menuOpen = true;
     drawMenu();
 }
 
 static void exitMenu() {
-    if (webServer) {
-        webServer->stop();
-        delete webServer;
-        webServer = nullptr;
-    }
-    if (webUp) {
-        WiFi.softAPdisconnect(true);
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        webUp = false;
-        delay(100);
-    }
-    const bool ok = espSdrBegin();
-    Serial.printf("[menu] receiver %s, mode %s, centre %d MHz\n", ok ? "restarted" : "RESTART FAILED",
-                  modeName(menuMode), menuCenter);
+    Serial.printf("[menu] mode %s, centre %d MHz\n", modeName(menuMode), menuCenter);
     gCaptureCenterMHz = menuCenter;
     gRangeMode = menuMode;
     menuOpen = false;
@@ -1023,21 +879,13 @@ static void menuTapped(int x, int y) {
             if (menuCenter < kFreqMinMHz) menuCenter = kFreqMinMHz;
             if (menuCenter > kFreqMaxMHz) menuCenter = kFreqMaxMHz;
             menuMode = kRangeNarrow;
-        } else if (i == 8) { rebootToBootloader(); return; }
-        else { exitMenu(); return; }
+        } else { exitMenu(); return; }
         drawMenu();
         return;
     }
 }
 
 static void handleMenu() {
-    if (webUp && webServer) webServer->handleClient();
-    if (webStartRequested) {
-        webStartRequested = false;
-        delay(300);                   // let the browser receive the reply
-        exitMenu();
-        return;
-    }
     static bool wasTouched = false;
     static uint32_t lastPoll = 0, lastContact = 0, lastTap = 0;
     static int lastX = 0, lastY = 0;
@@ -1121,29 +969,6 @@ static void handleSerial() {
                     } else {
                         Serial.printf("[rx] freq out of range (%d..%d MHz)\n", kFreqMinMHz, kFreqMaxMHz);
                     }
-                    used = 0;
-                    continue;
-                }
-                if (!strncmp(line, "wifi ", 5) || !strcmp(line, "wifi")) {
-                    // wifi <ssid> <password>  |  wifi clear  |  wifi (show saved SSID only)
-                    Preferences wifiCfg;
-                    if (!wifiCfg.begin("shcfg", false)) {
-                        Serial.println("[wifi] ERROR: could not open settings");
-                    } else if (!strcmp(line, "wifi")) {
-                        Serial.printf("[wifi] saved SSID: '%s'\n", wifiCfg.getString("ssid", "").c_str());
-                    } else if (!strcmp(line, "wifi clear")) {
-                        wifiCfg.remove("ssid");
-                        wifiCfg.remove("pass");
-                        Serial.println("[wifi] credentials removed (menu uses its own access point)");
-                    } else {
-                        char* ssidArg = line + 5;
-                        char* passArg = strchr(ssidArg, ' ');
-                        if (passArg) *passArg++ = '\0';
-                        wifiCfg.putString("ssid", ssidArg);
-                        wifiCfg.putString("pass", passArg ? passArg : "");
-                        Serial.printf("[wifi] saved SSID '%s' (password stored)\n", ssidArg);
-                    }
-                    wifiCfg.end();
                     used = 0;
                     continue;
                 }
@@ -1237,7 +1062,7 @@ static void handleSerial() {
                     used = 0;
                     continue;
                 }
-                Serial.println("Commands: range <start> <end> (MHz sweep) | wifi <ssid> <pass> | wifi clear | bootloader (download mode for flashing) | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
+                Serial.println("Commands: range <start> <end> (MHz sweep) | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
                                "wf 0-4 (classic|thermal|phosphor|gray|rainbow) | help");
             }
             used = 0; overflow = false;

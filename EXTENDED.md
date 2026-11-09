@@ -3,9 +3,9 @@
 This fork of [HB9IIU/ESP32-CYD-pocket-qo-100-spectrum-viewer](https://github.com/HB9IIU/ESP32-CYD-pocket-qo-100-spectrum-viewer)
 keeps everything of the original (touch gestures, trace styles, waterfall palettes, CF/SR estimator)
 and adds a **tunable receive frequency (2300–2500 MHz)**, two **wide sweep views**, a **touch menu**,
-a small **web page** and a few **serial commands**.
+a few **serial commands**.
 
-Version 1.2 (firmware binaries: see the GitHub Releases page). Original work: HB9IIU. Extensions: DG7NDV (2026). Licence stays Apache-2.0, see `docs/LICENSE` and `docs/NOTICE`.
+Version 1.3 (firmware binaries: see the GitHub Releases page). Original work: HB9IIU. Extensions: DG7NDV (2026). Licence stays Apache-2.0, see `docs/LICENSE` and `docs/NOTICE`.
 
 > **Status:** developed and tested only on the 2.8" CYD (type ESP32-2432S028, `CYD28Inch`) with an
 > [ESP32-DATV](https://github.com/SP8ESA/ESP32-DATV) transmitter as signal source. The 4" build compiles
@@ -44,11 +44,9 @@ stop / start     pause / resume the receiver
 status           print centre frequency and the current CF/SR result
 ```
 
-**Touch menu:** tap the **`=` button in the top-right corner**. The receiver stops and a menu opens with
+**Touch menu:** tap the **`=` button in the top-right corner**. The receiver stops and the menu opens at once with
 `QO-100`, `WLAN`, `MAX`, centre buttons `-10 -1 +1 +10` and `START`. `START` applies the choice and resumes.
-
-**Web page:** while the menu is open the CYD runs a small web server (see section 3) with the same
-mode / centre selection and a `START` button.
+There is no Wi-Fi or web page any more (removed in 1.3).
 
 Notes and limits:
 
@@ -92,7 +90,6 @@ Notes and limits:
 | `cal <kHz>` | add a fixed kHz correction to the displayed CF (saved in flash) |
 | `calref <MHz>` | with a signal present: set the correction so CF shows this reference, e.g. `calref 2403.750` |
 | `cal` | show the current correction |
-| `wifi <ssid> <password>` | save home Wi-Fi credentials (no spaces); `wifi` shows the saved SSID, `wifi clear` removes it |
 | `layout`, `mode`, `wf`, `burst`, `help` | unchanged from the original |
 
 In sweep views the peak is printed as `[pk] 2403.8 MHz level=215`. Without any signal the peak often shows the
@@ -103,26 +100,16 @@ whenever the value changes and every 2 s while a signal is detected.
 
 The per-second `[touch] idle …` debug lines of the original are muted.
 
-## 3. Menu and web page
+## 3. Menu
 
-- The Wi-Fi radio is also the receiver, so the web server only runs **while the menu is open** (receiver stopped).
-  Opening the menu releases the radio (`espSdrEnd()`), starts Wi-Fi, and `START` shuts it down and
-  re-arms the receiver.
-- With saved credentials (`wifi <ssid> <password>`) the CYD joins your **home network** and shows
-  `Web: http://<ip>/` on the display. If that fails within ~10 s it falls back to its own access point
-  `CYD-SPEC` (password `cyd-spec-1`, page at `http://192.168.4.1/`). *Joining the home network was not
-  verified on hardware.* Change the default AP password in `main.cpp` (`kApPass`) before use on a shared network.
-- The page offers mode, centre frequency and `START`, plus a **firmware update** form (`/update`, *untested*,
-  needs the two-slot partition table `partitions_ota.csv`; the default `partitions.csv` has a single app slot).
-  Anyone who can reach the page can upload firmware: use it only on a trusted network.
+Tapping `=` stops the receiver and shows the settings screen immediately; `START` applies the choice and resumes.
+Wi-Fi, access point, web page and web firmware update were part of 1.2 and are removed in 1.3.
 
 ## 4. Other changes
 
 - The header shows `by HB9IIU, extended by DG7NDV`, also on the splash screen.
 - The spectrum processor is allocated on the heap (static DRAM was full after adding the new features).
-- `bootloader` command and a `FLASH` menu button try to reboot into the ROM download mode without pressing
-  BOOT. **This did not work on the tested board** (GPIO0 is not held across the reset); flash with the
-  BOOT button as usual.
+- The earlier attempt to reboot into the ROM download mode from software did not work on the tested board and was removed; flash with the BOOT button.
 
 ## 5. Control GUI (`tools/spek_control.py`)
 
@@ -150,6 +137,6 @@ The browser installer linked at the top of the original README installs the **or
 
 ## 7. Files changed
 
-`src/main.cpp` (menu, web, serial commands, sweep, CF output), `src/spectrum.{h,cpp}` (runtime centre, raw mode),
+`src/main.cpp` (menu, serial commands, sweep, CF output), `src/spectrum.{h,cpp}` (runtime centre, raw mode),
 `src/esp_sdr.{h,cpp}` (wider tuning range, `espSdrEnd`, quiet retune), `src/touch_input.cpp` (idle log muted),
-`partitions_ota.csv` (optional), `tools/spek_control.py`, this file.
+`tools/spek_control.py`, this file.
