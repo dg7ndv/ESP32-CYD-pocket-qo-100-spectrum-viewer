@@ -2,10 +2,9 @@
 
 This fork of [HB9IIU/ESP32-CYD-pocket-qo-100-spectrum-viewer](https://github.com/HB9IIU/ESP32-CYD-pocket-qo-100-spectrum-viewer)
 keeps everything of the original (touch gestures, trace styles, waterfall palettes, CF/SR estimator)
-and adds a **tunable receive frequency (2300–2500 MHz)**, two **wide sweep views**, a **touch menu**,
-a few **serial commands**.
+and adds a **tunable receive frequency (2300–2500 MHz)**, two **wide sweep views**, a **touch menu**, **tap marker**, **max hold**, **touch zoom** and a few **serial commands**.
 
-Version 1.3 (firmware binaries: see the GitHub Releases page). Original work: HB9IIU. Extensions: DG7NDV (2026). Licence stays Apache-2.0, see `docs/LICENSE` and `docs/NOTICE`.
+Version 1.4 (firmware binaries: see the GitHub Releases page). Original work: HB9IIU. Extensions: DG7NDV (2026). Licence stays Apache-2.0, see `docs/LICENSE` and `docs/NOTICE`.
 
 > **Status:** developed and tested only on the 2.8" CYD (type ESP32-2432S028, `CYD28Inch`) with an
 > [ESP32-DATV](https://github.com/SP8ESA/ESP32-DATV) transmitter as signal source. The 4" build compiles
@@ -44,9 +43,24 @@ stop / start     pause / resume the receiver
 status           print centre frequency and the current CF/SR result
 ```
 
-**Touch menu:** tap the **`=` button in the top-right corner**. The receiver stops and the menu opens at once with
-`QO-100`, `WLAN`, `MAX`, centre buttons `-10 -1 +1 +10` and `START`. `START` applies the choice and resumes.
+**Touch menu:** tap the **`=` button in the top-right corner**. The menu opens at once with `QO-100`, `WLAN`,
+`MAX` (a tap applies the view immediately and returns to the spectrum), centre buttons `-10 -1 +1 +10`, `HOLD`
+and `OK` (applies a changed centre). The red `X` in the top-right corner closes the menu without changing anything.
 There is no Wi-Fi or web page any more (removed in 1.3).
+
+**Main screen (1.4):**
+
+| Action | Effect |
+|---|---|
+| Tap in the spectrum | marker: shows `MK <freq> \| PK <freq> MHz <dBFS>` (tapped frequency, strongest bin nearby and its level); tap next to the marker to clear it |
+| Press, hold and drag sideways | zoom into that frequency range: up to 12 MHz = zoomed single capture (31.25 kHz/bin), wider = sweep of that range |
+| Double tap or the **`C`** button (top left, next to `HOLD`) | back to the view before the first zoom (without zoom the double tap toggles the layout as in the original) |
+| **`HOLD`** button (top left) | max hold: a yellow line keeps the highest value per bin; tap again to switch off and clear |
+| Tap in the waterfall | cycle the waterfall palette (as in the original) |
+
+In the sweep views the strongest bin that stands about 10 dB above the noise is shown as `PK 2403.8 MHz` in the strip
+above the waterfall. The title says "QO-100 Uplink Spectrum Viewer" only in the QO-100 view (centre 2406 MHz),
+otherwise "Spectrum Viewer". The trace style is changed with the serial command `mode`.
 
 Notes and limits:
 
@@ -86,14 +100,16 @@ Notes and limits:
 | `qo100` / `rangewlan` / `maxrange` | view modes (table above) |
 | `range <start> <end>` | sweep a free range in whole MHz (2300..2500, max. 204 MHz wide; invalid values are rejected) |
 | `stop` / `start` | pause / resume |
+| `hold [on\|off\|clear]` | max hold line (`hold` toggles) |
 | `status` | centre frequency + CF/SR |
 | `cal <kHz>` | add a fixed kHz correction to the displayed CF (saved in flash) |
 | `calref <MHz>` | with a signal present: set the correction so CF shows this reference, e.g. `calref 2403.750` |
 | `cal` | show the current correction |
 | `layout`, `mode`, `wf`, `burst`, `help` | unchanged from the original |
 
-In sweep views the peak is printed as `[pk] 2403.8 MHz level=215`. Without any signal the peak often shows the
-first bin of the range (e.g. 2400.0 MHz); this is probably an edge artefact of the first window and not a signal.
+Debug lines: `[ui] …` (menu open/closed, taps, drags), `[zoom] …`, `[mk] …` and `[hold] …`; with the touch coordinates `[touch] raw=…` they show what a tap did.
+
+In sweep views the peak is printed as `[pk] 2403.8 MHz level=215`, or `[pk] none` when nothing stands clearly above the noise. The outermost bins are ignored. In the 2300–2500 MHz sweep strong peaks were seen at 2400.1 and 2440.0 MHz without a deliberate source; it was not clarified whether they are real signals or receiver artefacts.
 
 Machine-readable output on USB: `[cf] 2403.859 MHz sr=500 ksps` (or `[cf] none`) in the single-window views,
 whenever the value changes and every 2 s while a signal is detected.
@@ -102,8 +118,8 @@ The per-second `[touch] idle …` debug lines of the original are muted.
 
 ## 3. Menu
 
-Tapping `=` stops the receiver and shows the settings screen immediately; `START` applies the choice and resumes.
-Wi-Fi, access point, web page and web firmware update were part of 1.2 and are removed in 1.3.
+See section 1 (touch menu). The receiver keeps running behind the menu. Wi-Fi, access point, web page and
+web firmware update were part of 1.2 and are removed in 1.3.
 
 ## 4. Other changes
 
@@ -121,7 +137,7 @@ python3 tools/spek_control.py
 ```
 
 Port selection with auto-search, Start / Stop / Status, QO-100 / WLAN / MAX buttons, start and end frequency
-boxes (type or mouse wheel per digit, saved), 10 memory slots (click = recall or store, right click = overwrite,
+boxes (type or mouse wheel per digit, saved), a `Hold` button, 10 memory slots (click = recall or store, right click = overwrite,
 L = delete, R = rename) and a large display of the received CF / symbol rate / peak. Opening the port resets the
 board on many systems, so wait ~7 s after connecting.
 

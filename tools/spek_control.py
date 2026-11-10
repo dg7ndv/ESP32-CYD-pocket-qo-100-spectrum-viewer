@@ -246,6 +246,7 @@ class App(tk.Tk):
         ttk.Button(run, text="Start", width=10, command=lambda: self._send("start")).pack(side="left")
         ttk.Button(run, text="Stop", width=10, command=lambda: self._send("stop")).pack(side="left", padx=4)
         ttk.Button(run, text="Status", width=8, command=lambda: self._send("status")).pack(side="left")
+        ttk.Button(run, text="Hold", width=8, command=lambda: self._send("hold")).pack(side="left", padx=4)
 
         centre = ttk.Frame(self)
         centre.grid(row=3, column=0, columnspan=2, sticky="ew", **pad)
@@ -478,6 +479,10 @@ class App(tk.Tk):
             self.cf_var.set(f"{parts[0]} MHz")
             self.sr_var.set("Spitze")
             self.cf_label.config(foreground=COL_PK)
+        elif text.strip() == "none":
+            self.cf_var.set("--- MHz")
+            self.sr_var.set("")
+            self.cf_label.config(foreground=COL_OFF)
 
     def _poll(self):
         try:

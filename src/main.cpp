@@ -78,10 +78,15 @@ static uint8_t waterfall[kMaxWaterfallRows][kSpectrumBins] = {};
 static int waterfallHead = 0;
 static uint8_t smooth[kSpectrumBins] = {};
 static bool smoothPrimed = false;
+static uint8_t holdBins[kSpectrumBins] = {};   // max hold per bin
+static bool holdOn = false;
+static char lastStatus[64] = {};
+static constexpr int kFreqMinMHz = 2300, kFreqMaxMHz = 2500;
+static void drawHoldButton();
 static bool transmissionCenterValid = false;
 static int transmissionCenterKHz = (kBandLowKHz + kBandHighKHz) / 2;
 static int transmissionSymbolRateKsps = 0;
-static char drawnCenterLabel[48] = {};
+static char drawnCenterLabel[72] = {};
 static uint32_t lastCenterDetectionMs = 0;
 
 constexpr int kCenterDetectMarginDb = 15;
@@ -373,17 +378,134 @@ static void updateTransmissionCenter(const uint8_t* values, int lo, int hi) {
 static bool viewWide = false;
 static int viewLowMHz = 0, viewHighMHz = 0;
 
-// Sweep view: strongest display bin on serial, e.g. "[pk] 2403.8 MHz level=180".
-static void reportPeak(const SpectrumFrame& frame) {
+// Sweep view: strongest bin that stands clearly above the noise median. The outermost bins
+// are skipped (edge artefact of the first/last window). Held for kCenterHoldMs like the CF.
+static bool widePeakValid = false;
+static int widePeakKHz = 0, widePeakLevel = 0;
+
+static void updateWidePeak(const uint8_t* values, const SpectrumFrame& frame) {
+    constexpr int kEdgeBins = 3;
+    constexpr int kMarginCodes = 25;          // about 10 dB above the median
+    static uint32_t lastMs = 0;
+    const uint32_t now = millis();
+    int best = kEdgeBins;
+    for (int i = kEdgeBins; i < kSpectrumBins - kEdgeBins; ++i) if (values[i] > values[best]) best = i;
+    if (values[best] >= medianCode(values, kSpectrumBins) + kMarginCodes) {
+        widePeakKHz = frame.lowMHz * 1000
+            + (int)(((int64_t)best * 2 + 1) * (frame.highMHz - frame.lowMHz) * 1000 / (2 * kSpectrumBins));
+        widePeakLevel = values[best];
+        widePeakValid = true;
+        lastMs = now;
+    } else if (widePeakValid && now - lastMs >= kCenterHoldMs) {
+        widePeakValid = false;
+    }
+}
+
+// Tap marker: a tap in the spectrum plot marks that frequency, measures the strongest bin
+// nearby and shows both in the status line. Tapping next to the marker clears it.
+static bool markerOn = false;
+static int markerPixel = 0, markerWidth = 1;
+
+static int binToKHz(int bin) {
+    if (viewWide)
+        return viewLowMHz * 1000 + (int)(((int64_t)bin * 2 + 1) * (viewHighMHz - viewLowMHz) * 1000 / (2 * kSpectrumBins));
+    return captureLowKHz() + (int)(((int64_t)bin * 2 + 1) * kCaptureSpanKHz / (2 * kSpectrumBins));
+}
+
+static void markerText(char* out, size_t n, bool print) {
+    const int bin = spectrumBinForPixel(markerPixel, markerWidth);
+    const int reach = viewWide ? 6 : 4;
+    int best = bin;
+    for (int i = bin - reach; i <= bin + reach; ++i)
+        if (i >= 0 && i < kSpectrumBins && smooth[i] > smooth[best]) best = i;
+    const int mk = binToKHz(bin), pk = binToKHz(best), db = -100 + smooth[best] * 100 / 255;
+    snprintf(out, n, "MK %d.%03d | PK %d.%03d MHz %d dBFS", mk / 1000, mk % 1000, pk / 1000, pk % 1000, db);
+    if (print) Serial.printf("[mk] %d.%03d MHz peak=%d.%03d MHz level=%d dBFS\n", mk / 1000, mk % 1000, pk / 1000, pk % 1000, db);
+}
+
+// Zoom: press, hold and drag horizontally in the plot to pick a frequency range. A range of up to
+// 12 MHz becomes a zoomed single capture (31.25 kHz bins), a wider one a sweep of that range.
+// Double tap or the C button restores the view that was active before the first zoom.
+struct ViewState { int mode, centre, lo, hi, vlo, vhi; };
+static ViewState zoomBase = {};
+static bool zoomed = false;
+static bool selOn = false;
+static int selX0 = 0, selX1 = 0;
+
+static int pixelToKHz(int pixel, int width) {
+    if (gRangeMode != kRangeNarrow)
+        return viewLowMHz * 1000 + (int)((int64_t)pixel * (viewHighMHz - viewLowMHz) * 1000 / (width - 1));
+    return bandLowKHz() + (int)((int64_t)pixel * (bandHighKHz() - bandLowKHz()) / (width - 1));
+}
+
+static void clearZoom() {
+    zoomed = false;
+    gViewLowKHz = gViewHighKHz = 0;
+}
+
+static void restartOverlays() {
+    markerOn = false;
+    memset(holdBins, 0, sizeof(holdBins));
+    memset(lastStatus, 0, sizeof(lastStatus));
+}
+
+static bool resetZoom() {
+    if (!zoomed) return false;
+    gRangeMode = zoomBase.mode;
+    gCaptureCenterMHz = zoomBase.centre;
+    gRangeLowMHz = zoomBase.lo;
+    gRangeHighMHz = zoomBase.hi;
+    gViewLowKHz = zoomBase.vlo;
+    gViewHighKHz = zoomBase.vhi;
+    zoomed = false;
+    restartOverlays();
+    Serial.println("[zoom] original view");
+    return true;
+}
+
+static void applyZoom(int px0, int px1, int width) {
+    if (px0 > px1) { const int t = px0; px0 = px1; px1 = t; }
+    if (px0 < 0) px0 = 0;
+    if (px1 > width - 1) px1 = width - 1;
+    int lo = pixelToKHz(px0, width), hi = pixelToKHz(px1, width);
+    if (hi - lo < 250) return;                                  // less than about 8 bins: ignore
+    if (!zoomed) {
+        zoomBase = {gRangeMode, gCaptureCenterMHz, gRangeLowMHz, gRangeHighMHz, gViewLowKHz, gViewHighKHz};
+        zoomed = true;
+    }
+    if (hi - lo <= 12000) {                                     // fits one capture: zoom the display
+        int centre = ((lo + hi) / 2 + 500) / 1000;
+        if (centre < kFreqMinMHz) centre = kFreqMinMHz;
+        if (centre > kFreqMaxMHz) centre = kFreqMaxMHz;
+        if (lo < centre * 1000 - 6000) lo = centre * 1000 - 6000;
+        if (hi > centre * 1000 + 6000) hi = centre * 1000 + 6000;
+        gCaptureCenterMHz = centre;
+        gRangeMode = kRangeNarrow;
+        gViewLowKHz = lo;
+        gViewHighKHz = hi;
+    } else {                                                    // wider: sweep exactly that range
+        int loMHz = lo / 1000, hiMHz = (hi + 999) / 1000;
+        if (loMHz < 2290) loMHz = 2290;
+        if (hiMHz > 2510) hiMHz = 2510;
+        gRangeLowMHz = loMHz;
+        gRangeHighMHz = hiMHz;
+        gRangeMode = kRangeCustom;
+        gViewLowKHz = gViewHighKHz = 0;
+    }
+    restartOverlays();
+    Serial.printf("[zoom] %d.%03d-%d.%03d MHz\n", lo / 1000, lo % 1000, hi / 1000, hi % 1000);
+}
+
+// Sweep view on serial, e.g. "[pk] 2403.8 MHz level=180" or "[pk] none".
+static void reportPeak() {
     static uint32_t lastPrint = 0;
     const uint32_t now = millis();
     if (now - lastPrint < 2000) return;
     lastPrint = now;
-    int best = 0;
-    for (int i = 1; i < kSpectrumBins; ++i) if (frame.bins[i] > frame.bins[best]) best = i;
-    const int khz = frame.lowMHz * 1000
-        + (int)(((int64_t)best * 2 + 1) * (frame.highMHz - frame.lowMHz) * 1000 / (2 * kSpectrumBins));
-    Serial.printf("[pk] %d.%01d MHz level=%u\n", khz / 1000, (khz % 1000) / 100, frame.bins[best]);
+    if (widePeakValid)
+        Serial.printf("[pk] %d.%01d MHz level=%d\n", widePeakKHz / 1000, (widePeakKHz % 1000) / 100, widePeakLevel);
+    else
+        Serial.println("[pk] none");
 }
 
 // Machine-readable result on USB serial: "[cf] 2403.750 MHz sr=500 ksps" or "[cf] none".
@@ -411,7 +533,7 @@ static void reportTransmission(bool force) {
 
 // Draw once: this strip is outside the trace and waterfall repaint regions.
 static void drawTransmissionCenterLabel() {
-    char centerLabel[24], rateLabel[24], label[48];
+    char centerLabel[24], rateLabel[24], label[72];
     if (viewWide) {
         snprintf(centerLabel, sizeof(centerLabel), "%d MHz", viewLowMHz);
         snprintf(rateLabel, sizeof(rateLabel), "%d MHz", viewHighMHz);
@@ -420,12 +542,17 @@ static void drawTransmissionCenterLabel() {
                  transmissionCenterKHz / 1000, transmissionCenterKHz % 1000);
     else
         snprintf(centerLabel, sizeof(centerLabel), "CF = --- MHz");
+    char peakLabel[24] = "";
     if (viewWide) {
+        if (widePeakValid)
+            snprintf(peakLabel, sizeof(peakLabel), "PK %d.%01d MHz", widePeakKHz / 1000, (widePeakKHz % 1000) / 100);
+        else
+            snprintf(peakLabel, sizeof(peakLabel), "PK --- MHz");
     } else if (transmissionCenterValid)
         snprintf(rateLabel, sizeof(rateLabel), "SR est. %d ksps", transmissionSymbolRateKsps);
     else
         snprintf(rateLabel, sizeof(rateLabel), "SR = --- ksps");
-    snprintf(label, sizeof(label), "%s|%s", centerLabel, rateLabel);
+    snprintf(label, sizeof(label), "%s|%s|%s", centerLabel, rateLabel, peakLabel);
     if (!strcmp(label, drawnCenterLabel)) return;
 
     constexpr int margin = 8;
@@ -444,6 +571,11 @@ static void drawTransmissionCenterLabel() {
     tft.drawString(centerLabel, left, textY, textFont);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(rateLabel, right, textY, textFont);
+    if (peakLabel[0]) {
+        tft.setTextColor(widePeakValid ? color::rgb(255, 200, 0) : color::MID, color::BG);
+        tft.setTextDatum(TC_DATUM);
+        tft.drawString(peakLabel, tft.width() / 2, textY, textFont);
+    }
     snprintf(drawnCenterLabel, sizeof(drawnCenterLabel), "%s", label);
 }
 
@@ -478,7 +610,7 @@ static void applyLayout() {
 
 static void drawSpectrumTrace(int width, int right) {
     const float span = plotTopDbfs - plotBottomDbfs;
-    int prevY = kPlotTop;
+    int prevY = kPlotTop, prevHoldY = -1;
     for (int pixel = 0; pixel < width; ++pixel) {
         const int bin = spectrumBinForPixel(pixel, width);
         const int dbfs = -100 + smooth[bin] * 100 / 255;
@@ -511,6 +643,19 @@ static void drawSpectrumTrace(int width, int right) {
             else tft.drawPixel(x, y, traceColor);
         }
         prevY = y;
+        if (markerOn && pixel == markerPixel) tft.drawFastVLine(x, kPlotTop, plotHeight, color::BRIGHT);
+        if (selOn) {                                    // range being dragged: edges and a bar on top
+            const int a = selX0 < selX1 ? selX0 : selX1, b = selX0 < selX1 ? selX1 : selX0;
+            if (pixel == a || pixel == b) tft.drawFastVLine(x, kPlotTop, plotHeight, color::rgb(0, 220, 255));
+            else if (pixel > a && pixel < b) tft.drawPixel(x, kPlotTop + 1, color::rgb(0, 220, 255));
+        }
+        if (holdOn) {                                   // max hold line on top of the trace
+            int hy = kPlotTop + (int)lroundf((plotTopDbfs - (-100 + holdBins[bin] * 100 / 255)) * (plotHeight - 1) / span);
+            if (hy < kPlotTop) hy = kPlotTop;
+            if (hy > kPlotTop + plotHeight - 1) hy = kPlotTop + plotHeight - 1;
+            if (prevHoldY >= 0) tft.drawLine(x - 1, prevHoldY, x, hy, color::rgb(255, 210, 0));
+            prevHoldY = hy;
+        }
     }
     // Grid stays on multiples of 10 dBFS, so it slides as the scale adapts.
     for (int db = (int)floorf(plotTopDbfs / 10.0f) * 10; db >= plotBottomDbfs; db -= 10) {
@@ -522,16 +667,22 @@ static void drawSpectrumTrace(int width, int right) {
     }
 }
 
-static char lastStatus[64] = {};
 
 static void drawFrame(const SpectrumFrame& frame) {
     const int right = tft.width() - 6, width = right - kPlotLeft;
     static int lastGain = -1;
     static bool lastFilter = false;
     static bool lastWide = false;
+    static int lastLow = 0, lastHigh = 0, lastCentre = 0;
+    if (frame.lowMHz != lastLow || frame.highMHz != lastHigh || gCaptureCenterMHz != lastCentre) {
+        memset(holdBins, 0, sizeof(holdBins));          // new range/centre: restart max hold
+        markerOn = false;
+        lastLow = frame.lowMHz; lastHigh = frame.highMHz; lastCentre = gCaptureCenterMHz;
+    }
     if (!frame.valid || frame.gain != lastGain || frame.burstFiltered != lastFilter
         || frame.wide != lastWide) {
         smoothPrimed = false;
+        memset(holdBins, 0, sizeof(holdBins));
         memset(waterfall, 0, sizeof(waterfall));
     }
     lastGain = frame.gain;
@@ -541,12 +692,17 @@ static void drawFrame(const SpectrumFrame& frame) {
     char status[64];
     if (!frame.valid) snprintf(status, sizeof(status), "%s", frame.error);
     else if (frame.clipped) snprintf(status, sizeof(status), "CLIPPING (gain %u)", frame.gain);
+    else if (markerOn) markerText(status, sizeof(status), false);
     else if (frame.wide)
         snprintf(status, sizeof(status), "SWEEP %d-%d MHz | %d kHz/bin", frame.lowMHz, frame.highMHz,
                  (frame.highMHz - frame.lowMHz) * 1000 / kSpectrumBins);
+    else if (gViewLowKHz)
+        snprintf(status, sizeof(status), "ZOOM %d.%03d-%d.%03d MHz | 31.25 kHz/bin",
+                 gViewLowKHz / 1000, gViewLowKHz % 1000, gViewHighKHz / 1000, gViewHighKHz % 1000);
     else snprintf(status, sizeof(status), "%d bins | 31.25 kHz spacing", kSpectrumBins);
     static uint16_t lastStatusColor = 0;
-    const uint16_t statusColor = frame.valid && !frame.clipped ? color::MID : color::ERROR;
+    const uint16_t statusColor = !(frame.valid && !frame.clipped) ? color::ERROR
+        : markerOn ? color::rgb(255, 210, 0) : color::MID;
     if (strcmp(status, lastStatus) || statusColor != lastStatusColor) {
         tft.fillRect(0, kStatusY, tft.width(), kPlotTop - kStatusY, color::BG);
         tft.setTextDatum(TC_DATUM);
@@ -559,12 +715,15 @@ static void drawFrame(const SpectrumFrame& frame) {
     for (int i = 0; i < kSpectrumBins; ++i)
         smooth[i] = smoothPrimed ? (smooth[i] * 2 + frame.bins[i]) / 3 : frame.bins[i];
     smoothPrimed = frame.valid;
+    if (holdOn && frame.valid)
+        for (int i = 0; i < kSpectrumBins; ++i) if (smooth[i] > holdBins[i]) holdBins[i] = smooth[i];
     if (frame.valid)
         updateAutoScale(smooth, spectrumBinForPixel(0, width),
                         spectrumBinForPixel(width - 1, width));
     if (frame.valid && frame.wide) {
         transmissionCenterValid = false;
-        reportPeak(frame);
+        updateWidePeak(smooth, frame);
+        reportPeak();
     } else if (frame.valid)
         updateTransmissionCenter(smooth, spectrumBinForPixel(0, width),
                                  spectrumBinForPixel(width - 1, width));
@@ -747,13 +906,27 @@ static void setLayout(int layout) {
 }
 
 // A single tap acts on the part of the screen it hits.
-static void singleTapAction(int y) {
-    if (screenLayout == kLayoutWaterfall || (screenLayout == kLayoutBoth && y >= waterfallTop))
+static void singleTapAction(int x, int y) {
+    if (screenLayout == kLayoutWaterfall || (screenLayout == kLayoutBoth && y >= waterfallTop)) {
         cycleWaterfallStyle();
-    else cycleTraceMode();
+        return;
+    }
+    // Spectrum plot: set / move / clear the frequency marker (trace style: serial "mode").
+    markerWidth = tft.width() - 6 - kPlotLeft;
+    int pixel = x - kPlotLeft;
+    if (pixel < 0) pixel = 0;
+    if (pixel > markerWidth - 1) pixel = markerWidth - 1;
+    if (markerOn && abs(pixel - markerPixel) <= 10) {
+        markerOn = false;
+        memset(lastStatus, 0, sizeof(lastStatus));
+    } else {
+        markerPixel = pixel;
+        markerOn = true;
+        char t[64];
+        markerText(t, sizeof(t), true);
+    }
 }
 
-static constexpr int kFreqMinMHz = 2300, kFreqMaxMHz = 2500;
 constexpr uint32_t kReleaseHoldMs = 100;
 // A double tap toggles combined/full-spectrum layout; a single tap changes the
 // style of the part it hits.
@@ -761,6 +934,8 @@ constexpr uint32_t kDoubleTapMs = 350;
 // Contact counts as continuous across short pressure dropouts of the panel.
 
 static void drawHeader();
+static bool headerQo = true;   // header drawn as QO-100 view (centre 2406, narrow)
+static bool isQoView() { return gRangeMode == kRangeNarrow && gCaptureCenterMHz == kCaptureCenterMHz; }
 
 // Software "BOOT button": the ROM loader reads this RTC flag after the reset and stays
 // in serial download mode, so esptool can flash without touching the board.
@@ -789,9 +964,10 @@ static void rebootToBootloader() {
 // ---------------------------------------------------------------- menu
 // MENU button (top right): stops the receiver and opens the settings screen at once.
 static bool menuOpen = false;
+static bool ignoreTouchUntilRelease = false;   // the touch that opened/closed the menu must not act twice
 static int menuMode = kRangeNarrow, menuCenter = kCaptureCenterMHz;
 struct MenuButton { int x, y, w, h; const char* label; };
-static MenuButton menuButtons[8];
+static MenuButton menuButtons[10];
 static int menuButtonCount = 0;
 
 static const char* modeName(int mode) {
@@ -812,7 +988,6 @@ static void drawMenu() {
     tft.fillScreen(color::BG);
     tft.setTextDatum(TC_DATUM);
     tft.setTextColor(color::BRIGHT, color::BG);
-    tft.drawString("SETTINGS - receiver stopped", W / 2, 2, 2);
     const int g = 6;
     const int bw = (W - 4 * g) / 3;
     const int rowH = H * 17 / 100;
@@ -827,13 +1002,18 @@ static void drawMenu() {
     menuButtons[n++] = {2 * g + sw, y2, sw, rowH, "-1"};
     menuButtons[n++] = {3 * g + 2 * sw, y2, sw, rowH, "+1"};
     menuButtons[n++] = {4 * g + 3 * sw, y2, sw, rowH, "+10"};
-    menuButtons[n++] = {g, H * 72 / 100, W - 2 * g, H * 24 / 100, "START"};
+    const int sw2 = (W - 3 * g) * 62 / 100;
+    menuButtons[n++] = {g, H * 72 / 100, sw2, H * 24 / 100, "OK"};
+    menuButtons[n++] = {2 * g + sw2, H * 72 / 100, W - 3 * g - sw2, H * 24 / 100, "HOLD"};
+    menuButtons[n++] = {W - 34, 2, 32, 26, "X"};     // close without changing anything
     menuButtonCount = n;
     drawMenuButton(menuButtons[0], menuMode == kRangeNarrow && menuCenter == kCaptureCenterMHz, color::DIM);
     drawMenuButton(menuButtons[1], menuMode == kRangeWlan, color::DIM);
     drawMenuButton(menuButtons[2], menuMode == kRangeMax, color::DIM);
     for (int i = 3; i < 7; ++i) drawMenuButton(menuButtons[i], false, color::DIM);
     drawMenuButton(menuButtons[7], false, color::rgb(0, 110, 40));
+    drawMenuButton(menuButtons[8], holdOn, color::DIM);
+    drawMenuButton(menuButtons[9], false, color::rgb(120, 0, 0));
     char line[64];
     if (menuMode == kRangeNarrow) snprintf(line, sizeof(line), "Centre %d MHz (16 MHz window)", menuCenter);
     else if (menuMode == kRangeCustom)
@@ -846,39 +1026,54 @@ static void drawMenu() {
 }
 
 static void enterMenu() {
-    if (menuOpen) return;
-    gRxRunning = false;
-    delay(250);                       // let the receiver task finish its burst
+    if (menuOpen) return;             // the receiver keeps running behind the menu
     menuMode = gRangeMode;
     menuCenter = gCaptureCenterMHz;
     menuOpen = true;
+    ignoreTouchUntilRelease = true;
+    Serial.println("[ui] menu open");
     drawMenu();
 }
 
 static void exitMenu() {
     Serial.printf("[menu] mode %s, centre %d MHz\n", modeName(menuMode), menuCenter);
+    if (menuMode != gRangeMode || menuCenter != gCaptureCenterMHz) clearZoom();   // new view chosen
     gCaptureCenterMHz = menuCenter;
     gRangeMode = menuMode;
     menuOpen = false;
     memset(lastStatus, 0, sizeof(lastStatus));
     drawHeader();
     applyLayout();
-    gRxRunning = true;
+    xQueueReset(frameQueue);          // drop frames that piled up while the menu was open
+    ignoreTouchUntilRelease = true;
+    Serial.println("[ui] menu closed");
 }
 
 static void menuTapped(int x, int y) {
     for (int i = 0; i < menuButtonCount; ++i) {
         const MenuButton& b = menuButtons[i];
         if (x < b.x || x >= b.x + b.w || y < b.y || y >= b.y + b.h) continue;
-        if (i == 0) { menuMode = kRangeNarrow; menuCenter = kCaptureCenterMHz; }
-        else if (i == 1) menuMode = kRangeWlan;
-        else if (i == 2) menuMode = kRangeMax;
+        Serial.printf("[ui] menu button %d (%s) at x=%d y=%d\n", i, b.label, x, y);
+        if (i <= 2) {                      // QO-100 / WLAN / MAX: apply at once, back to the spectrum
+            if (i == 0) { menuMode = kRangeNarrow; menuCenter = kCaptureCenterMHz; }
+            else menuMode = i == 1 ? kRangeWlan : kRangeMax;
+            exitMenu();
+            return;
+        }
         else if (i >= 3 && i <= 6) {
             static const int steps[4] = {-10, -1, 1, 10};
             menuCenter += steps[i - 3];
             if (menuCenter < kFreqMinMHz) menuCenter = kFreqMinMHz;
             if (menuCenter > kFreqMaxMHz) menuCenter = kFreqMaxMHz;
             menuMode = kRangeNarrow;
+        } else if (i == 8) {
+            holdOn = !holdOn;
+            memset(holdBins, 0, sizeof(holdBins));
+        } else if (i == 9) {               // X: close, keep the current view
+            menuMode = gRangeMode;
+            menuCenter = gCaptureCenterMHz;
+            exitMenu();
+            return;
         } else { exitMenu(); return; }
         drawMenu();
         return;
@@ -895,8 +1090,14 @@ static void handleMenu() {
     int x = 0, y = 0;
     if (touchRead(x, y)) { lastContact = now; lastX = x; lastY = y; }
     const bool touched = (uint32_t)(now - lastContact) < kReleaseHoldMs;
+    if (ignoreTouchUntilRelease) {
+        if (!touched) ignoreTouchUntilRelease = false;
+        wasTouched = touched;
+        return;
+    }
     if (touched && !wasTouched && (uint32_t)(now - lastTap) > 250) {
         lastTap = now;
+        Serial.printf("[ui] menu tap x=%d y=%d\n", lastX, lastY);
         menuTapped(lastX, lastY);
     }
     wasTouched = touched;
@@ -904,13 +1105,13 @@ static void handleMenu() {
 
 
 static void handleModeInput() {
-    static bool wasTouched = false, pending = false;
+    static bool wasTouched = false, pending = false, down = false, dragging = false;
     static uint32_t lastPoll = 0, lastDown = 0, lastContact = 0, pendingMs = 0;
-    static int pendingY = 0;
+    static int pendingX = 0, pendingY = 0, downX = 0, downY = 0, curX = 0;
     const uint32_t now = millis();
     if (pending && (uint32_t)(now - pendingMs) >= kDoubleTapMs) {
         pending = false;
-        singleTapAction(pendingY);
+        singleTapAction(pendingX, pendingY);
     }
     if ((uint32_t)(now - lastPoll) < 15) return;
     lastPoll = now;
@@ -919,26 +1120,69 @@ static void handleModeInput() {
     static int lastX = 0, lastY = 0;
     if (touchRead(x, y)) { lastContact = now; lastX = x; lastY = y; }
     const bool touched = (uint32_t)(now - lastContact) < kReleaseHoldMs;
-    bool tap = false;
-    int tapY = 0;
+    if (ignoreTouchUntilRelease) {          // finger that just closed the menu is still down
+        if (!touched) ignoreTouchUntilRelease = false;
+        wasTouched = touched;
+        return;
+    }
+    const int plotWidth = tft.width() - 6 - kPlotLeft;
     if (touched && !wasTouched && (uint32_t)(now - lastDown) > 80) {
         lastDown = now;
+        if (lastX < 31 && lastY < 36) {                  // HOLD corner button
+            wasTouched = touched;
+            holdOn = !holdOn;
+            memset(holdBins, 0, sizeof(holdBins));
+            drawHoldButton();
+            return;
+        }
+        if (lastX >= 32 && lastX < 66 && lastY < 36) {   // C corner button: original zoom
+            wasTouched = touched;
+            resetZoom();
+            return;
+        }
         if (lastX >= tft.width() - 64 && lastY < 36) {   // MENU corner button
             wasTouched = touched;
             enterMenu();
             return;
         }
-        tap = y >= kPlotTop;
-        tapY = y;
+        if (lastY >= kPlotTop) {                         // start of a tap or of a zoom drag
+            down = true;
+            dragging = false;
+            downX = curX = lastX;
+            downY = lastY;
+        }
     }
-    if (tap) {
-        if (pending && (uint32_t)(now - pendingMs) < kDoubleTapMs) {
-            pending = false;
-            setLayout(screenLayout == kLayoutBoth ? kLayoutSpectrum : kLayoutBoth);
+    if (touched && down) {
+        curX = lastX;
+        if (!dragging && abs(curX - downX) >= 12) dragging = true;
+        if (dragging) {
+            selOn = true;
+            selX0 = downX - kPlotLeft;
+            selX1 = curX - kPlotLeft;
+            if (selX0 < 0) selX0 = 0;
+            if (selX1 < 0) selX1 = 0;
+            if (selX0 > plotWidth - 1) selX0 = plotWidth - 1;
+            if (selX1 > plotWidth - 1) selX1 = plotWidth - 1;
+        }
+    }
+    if (!touched && wasTouched && down) {                // release
+        down = false;
+        selOn = false;
+        if (dragging) {
+            dragging = false;
+            Serial.printf("[ui] drag x=%d..%d\n", downX, curX);
+            applyZoom(downX - kPlotLeft, curX - kPlotLeft, plotWidth);
         } else {
-            pending = true;
-            pendingMs = now;
-            pendingY = tapY;
+            Serial.printf("[ui] main tap x=%d y=%d\n", downX, downY);
+            if (pending && (uint32_t)(now - pendingMs) < kDoubleTapMs) {
+                pending = false;
+                if (!resetZoom()) setLayout(screenLayout == kLayoutBoth ? kLayoutSpectrum : kLayoutBoth);
+            } else {
+                pending = true;
+                pendingMs = now;
+                pendingX = downX;
+                pendingY = downY;
+            }
         }
     }
     wasTouched = touched;
@@ -974,6 +1218,19 @@ static void handleSerial() {
                 }
                 if (!strcmp(line, "bootloader")) {
                     rebootToBootloader();
+                }
+                if (!strncmp(line, "freq ", 5) || !strncmp(line, "range ", 6) || !strcmp(line, "qo100")
+                    || !strcmp(line, "rangewlan") || !strcmp(line, "maxrange"))
+                    clearZoom();
+                if (!strcmp(line, "hold") || !strncmp(line, "hold ", 5)) {
+                    if (!strcmp(line, "hold clear")) memset(holdBins, 0, sizeof(holdBins));
+                    else if (!strcmp(line, "hold off")) holdOn = false;
+                    else if (!strcmp(line, "hold on")) { holdOn = true; memset(holdBins, 0, sizeof(holdBins)); }
+                    else if (!strcmp(line, "hold")) { holdOn = !holdOn; memset(holdBins, 0, sizeof(holdBins)); }
+                    if (!menuOpen) drawHoldButton();
+                    Serial.printf("[hold] %s\n", holdOn ? "on" : "off");
+                    used = 0;
+                    continue;
                 }
                 if (!strncmp(line, "range ", 6)) {
                     int lo = 0, hi = 0;
@@ -1062,7 +1319,7 @@ static void handleSerial() {
                     used = 0;
                     continue;
                 }
-                Serial.println("Commands: range <start> <end> (MHz sweep) | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
+                Serial.println("Commands: range <start> <end> (MHz sweep) | hold [on|off|clear] (max hold line) | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
                                "wf 0-4 (classic|thermal|phosphor|gray|rainbow) | help");
             }
             used = 0; overflow = false;
@@ -1074,13 +1331,14 @@ static void handleSerial() {
 // Title block plus the MENU corner button (top right).
 static void drawHeader() {
     tft.fillScreen(color::BG);
-    const char* const title = "QO-100 Uplink Spectrum Viewer";
+    headerQo = isQoView();
+    const char* const title = headerQo ? "QO-100 Uplink Spectrum Viewer" : "Spectrum Viewer";
     const int titleFont = tft.textWidth(title, 2) <= tft.width() - 8 ? 2 : 1;
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(color::MID, color::BG);
     char versionLabel[64];
     snprintf(versionLabel, sizeof(versionLabel), "Ver. %s", APP_VERSION);
-    tft.drawString(versionLabel, 4, 0, 1);
+    tft.drawString(versionLabel, 68, 0, 1);
     tft.setTextDatum(TR_DATUM);
     tft.drawString("by HB9IIU, extended by DG7NDV", tft.width() - 34, 0, 1);   // left of the MENU button
     tft.setTextDatum(TC_DATUM);
@@ -1091,6 +1349,22 @@ static void drawHeader() {
     tft.setTextColor(color::BRIGHT, color::DIM);
     tft.setTextDatum(MC_DATUM);
     tft.drawString("=", tft.width() - 15, 11, 4);
+    drawHoldButton();
+    tft.fillRoundRect(32, 0, 30, 22, 4, color::DIM);     // C: back to the original (unzoomed) view
+    tft.drawRoundRect(32, 0, 30, 22, 4, color::MID);
+    tft.setTextColor(color::BRIGHT, color::DIM);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("C", 47, 11, 4);
+}
+
+// Max hold button, top left (mirror of the menu button); yellow while max hold is on.
+static void drawHoldButton() {
+    const uint16_t fill = holdOn ? color::rgb(255, 210, 0) : color::DIM;
+    tft.fillRoundRect(0, 0, 30, 22, 4, fill);
+    tft.drawRoundRect(0, 0, 30, 22, 4, color::MID);
+    tft.setTextColor(holdOn ? color::BG : color::BRIGHT, fill);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("HOLD", 15, 11, 1);
 }
 
 void setup() {
@@ -1174,7 +1448,13 @@ void loop() {
         return;
     }
     handleModeInput();
+    if (menuOpen) return;                  // the tap just opened the menu: do not paint a frame over it
     handleSerial();
+    if (isQoView() != headerQo) {          // title only says "QO-100" in the QO-100 view
+        memset(lastStatus, 0, sizeof(lastStatus));
+        drawHeader();
+        applyLayout();
+    }
     SpectrumFrame frame;
     if (xQueueReceive(frameQueue, &frame, 0) == pdTRUE) drawFrame(frame);
     delay(10);

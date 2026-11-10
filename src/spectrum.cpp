@@ -11,6 +11,7 @@ int signed10(uint32_t value) {
 
 volatile int gCaptureCenterMHz = kCaptureCenterMHz;
 volatile int gRangeMode = kRangeNarrow;
+volatile int gViewLowKHz = 0, gViewHighKHz = 0;
 volatile int gRangeLowMHz = kMaxLowMHz, gRangeHighMHz = kMaxHighMHz;
 
 int spectrumBinForPixel(int pixel, int width) {

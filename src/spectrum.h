@@ -14,8 +14,14 @@ inline int captureLowKHz() { return gCaptureCenterMHz * 1000 - kCaptureSpanKHz /
 constexpr int kBandLowKHz = 2401000;
 constexpr int kBandHighKHz = 2410000;
 // The displayed band follows the capture centre (default centre 2406 -> 2401..2410 MHz).
-inline int bandLowKHz() { return kBandLowKHz + (gCaptureCenterMHz - kCaptureCenterMHz) * 1000; }
-inline int bandHighKHz() { return kBandHighKHz + (gCaptureCenterMHz - kCaptureCenterMHz) * 1000; }
+// Zoom: when gViewLowKHz/gViewHighKHz are set (touch drag) the plot shows only that part of the capture.
+extern volatile int gViewLowKHz, gViewHighKHz;   // 0 = default view
+inline int bandLowKHz() {
+    return gViewLowKHz ? gViewLowKHz : kBandLowKHz + (gCaptureCenterMHz - kCaptureCenterMHz) * 1000;
+}
+inline int bandHighKHz() {
+    return gViewHighKHz ? gViewHighKHz : kBandHighKHz + (gCaptureCenterMHz - kCaptureCenterMHz) * 1000;
+}
 static_assert(kBandLowKHz >= kCaptureCenterMHz * 1000 - kCaptureSpanKHz / 2 &&
               kBandHighKHz < kCaptureCenterMHz * 1000 + kCaptureSpanKHz / 2,
               "Capture must contain the entire DATV band");
