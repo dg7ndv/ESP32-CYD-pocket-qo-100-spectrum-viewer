@@ -401,10 +401,30 @@ static void updateWidePeak(const uint8_t* values, const SpectrumFrame& frame) {
     }
 }
 
-// Tap marker: a tap in the spectrum plot marks that frequency, measures the strongest bin
-// nearby and shows both in the status line. Tapping next to the marker clears it.
-static bool markerOn = false;
-static int markerPixel = 0, markerWidth = 1;
+// Tap markers (up to 4): a tap in the spectrum plot sets the next marker, a tap next to a marker clears it.
+// Each marker measures the strongest bin nearby; with two or more markers the table also shows the
+// frequency/level difference and the band power between M1 and M2 (all levels are relative dBFS).
+constexpr int kMaxMarkers = 4;
+static bool markerOn[kMaxMarkers] = {};
+static int markerPixel[kMaxMarkers] = {};
+static int markerWidth = 1, markerNext = 0, markerLast = 0;
+
+static uint16_t markerColor(int k) {
+    static const uint16_t c[kMaxMarkers] = {color::rgb(255, 210, 0), color::rgb(255, 80, 255),
+                                            color::rgb(120, 255, 80), color::rgb(255, 140, 0)};
+    return c[k];
+}
+
+static int markerCount() {
+    int n = 0;
+    for (int k = 0; k < kMaxMarkers; ++k) n += markerOn[k];
+    return n;
+}
+
+static void clearMarkers() {
+    for (int k = 0; k < kMaxMarkers; ++k) markerOn[k] = false;
+    markerNext = 0;
+}
 
 static int binToKHz(int bin) {
     if (viewWide)
@@ -412,15 +432,113 @@ static int binToKHz(int bin) {
     return captureLowKHz() + (int)(((int64_t)bin * 2 + 1) * kCaptureSpanKHz / (2 * kSpectrumBins));
 }
 
-static void markerText(char* out, size_t n, bool print) {
-    const int bin = spectrumBinForPixel(markerPixel, markerWidth);
+// Marker k: tapped frequency, strongest bin nearby (frequency and level).
+static void markerMeasure(int k, int& mkKHz, int& pkKHz, int& db) {
+    const int bin = spectrumBinForPixel(markerPixel[k], markerWidth);
     const int reach = viewWide ? 6 : 4;
     int best = bin;
     for (int i = bin - reach; i <= bin + reach; ++i)
         if (i >= 0 && i < kSpectrumBins && smooth[i] > smooth[best]) best = i;
-    const int mk = binToKHz(bin), pk = binToKHz(best), db = -100 + smooth[best] * 100 / 255;
-    snprintf(out, n, "MK %d.%03d | PK %d.%03d MHz %d dBFS", mk / 1000, mk % 1000, pk / 1000, pk % 1000, db);
-    if (print) Serial.printf("[mk] %d.%03d MHz peak=%d.%03d MHz level=%d dBFS\n", mk / 1000, mk % 1000, pk / 1000, pk % 1000, db);
+    mkKHz = binToKHz(bin);
+    pkKHz = binToKHz(best);
+    db = -100 + smooth[best] * 100 / 255;
+}
+
+// Power of all bins between the first two markers, in dBFS (sum of the linear bin powers).
+static bool markerBandPower(int& loKHz, int& hiKHz, int& powerDb) {
+    int idx[2], n = 0;
+    for (int k = 0; k < kMaxMarkers && n < 2; ++k) if (markerOn[k]) idx[n++] = k;
+    if (n < 2) return false;
+    int b0 = spectrumBinForPixel(markerPixel[idx[0]], markerWidth);
+    int b1 = spectrumBinForPixel(markerPixel[idx[1]], markerWidth);
+    if (b0 > b1) { const int t = b0; b0 = b1; b1 = t; }
+    float sum = 0;
+    for (int i = b0; i <= b1; ++i) sum += powf(10.0f, (-100.0f + smooth[i] * 100.0f / 255.0f) / 10.0f);
+    loKHz = binToKHz(b0);
+    hiKHz = binToKHz(b1);
+    powerDb = (int)lroundf(10.0f * log10f(sum));
+    return true;
+}
+
+static void markerText(int k, char* out, size_t n) {
+    int mk, pk, db;
+    markerMeasure(k, mk, pk, db);
+    snprintf(out, n, "M%d %d.%03d | PK %d.%03d MHz %d dBFS", k + 1, mk / 1000, mk % 1000, pk / 1000, pk % 1000, db);
+}
+
+static void printMarkers() {
+    for (int k = 0; k < kMaxMarkers; ++k) {
+        if (!markerOn[k]) continue;
+        int mk, pk, db;
+        markerMeasure(k, mk, pk, db);
+        Serial.printf("[mk] M%d %d.%03d MHz peak=%d.%03d MHz level=%d dBFS\n", k + 1, mk / 1000, mk % 1000,
+                      pk / 1000, pk % 1000, db);
+    }
+    int lo, hi, p;
+    if (markerBandPower(lo, hi, p))
+        Serial.printf("[band] %d.%03d-%d.%03d MHz power=%d dBFS\n", lo / 1000, lo % 1000, hi / 1000, hi % 1000, p);
+}
+
+// Marker table, top-left of the plot. The text is rebuilt at most every 400 ms (calm numbers) and the
+// trace does not paint over the table rectangle, so the table does not flicker.
+constexpr int kTableMaxLines = 6, kTableWidth = 214;
+static char tableText[kTableMaxLines][48];
+static uint16_t tableColor[kTableMaxLines];
+static int tableLines = 0;
+
+static void updateMarkerTable() {
+    static uint32_t lastBuild = 0;
+    static uint32_t lastSet = 0xFFFFFFFFu;
+    uint32_t set = 0;
+    for (int k = 0; k < kMaxMarkers; ++k) if (markerOn[k]) set = set * 1009u + 1u + (uint32_t)markerPixel[k] + (uint32_t)k * 4096u;
+    const uint32_t now = millis();
+    if (set == lastSet && now - lastBuild < 400) return;
+    lastSet = set;
+    lastBuild = now;
+    const int rows = markerCount() ? (plotHeight - 4) / 9 : 0;
+    int line = 0;
+    int mkList[kMaxMarkers], n = 0;
+    for (int k = 0; k < kMaxMarkers && line < rows && line < kTableMaxLines; ++k) {
+        if (!markerOn[k]) continue;
+        int mk, pk, db;
+        markerMeasure(k, mk, pk, db);
+        mkList[n++] = k;
+        snprintf(tableText[line], sizeof(tableText[line]), "M%d %d.%03d  pk %d.%03d  %d dBFS ", k + 1,
+                 mk / 1000, mk % 1000, pk / 1000, pk % 1000, db);
+        tableColor[line++] = markerColor(k);
+    }
+    if (n >= 2 && line < rows && line < kTableMaxLines) {
+        int m0, p0, d0, m1, p1, d1;
+        markerMeasure(mkList[0], m0, p0, d0);
+        markerMeasure(mkList[1], m1, p1, d1);
+        snprintf(tableText[line], sizeof(tableText[line]), "d %d kHz  %+d dB ", m1 - m0, d1 - d0);
+        tableColor[line++] = color::BRIGHT;
+    }
+    int lo, hi, p;
+    if (line < rows && line < kTableMaxLines && markerBandPower(lo, hi, p)) {
+        snprintf(tableText[line], sizeof(tableText[line]), "P %d.%03d-%d.%03d  %d dBFS ", lo / 1000, lo % 1000,
+                 hi / 1000, hi % 1000, p);
+        tableColor[line++] = color::BRIGHT;
+    }
+    tableLines = line;
+}
+
+// Rectangle the trace must leave alone (valid when a table is shown).
+static bool markerTableRect(int& x1, int& bottom) {
+    if (!tableLines || !markerCount()) return false;
+    x1 = kPlotLeft + kTableWidth;
+    bottom = kPlotTop + 2 + 9 * tableLines + 1;
+    return true;
+}
+
+static void drawMarkerTable() {
+    int x1, bottom;
+    if (!markerTableRect(x1, bottom)) return;
+    tft.setTextDatum(TL_DATUM);
+    for (int i = 0; i < tableLines; ++i) {
+        tft.setTextColor(tableColor[i], color::BG);
+        tft.drawString(tableText[i], kPlotLeft + 2, kPlotTop + 2 + 9 * i, 1);
+    }
 }
 
 // Zoom: press, hold and drag horizontally in the plot to pick a frequency range. A range of up to
@@ -444,7 +562,7 @@ static void clearZoom() {
 }
 
 static void restartOverlays() {
-    markerOn = false;
+    clearMarkers();
     memset(holdBins, 0, sizeof(holdBins));
     memset(lastStatus, 0, sizeof(lastStatus));
 }
@@ -610,19 +728,42 @@ static void applyLayout() {
 
 static void drawSpectrumTrace(int width, int right) {
     const float span = plotTopDbfs - plotBottomDbfs;
+    const int bottom = kPlotTop + plotHeight;
+    updateMarkerTable();
+    int tableX1 = 0, tableBottom = 0;
+    const bool haveTable = markerTableRect(tableX1, tableBottom);
+    if (haveTable && tableBottom > bottom) tableBottom = bottom;
     int prevY = kPlotTop, prevHoldY = -1;
     for (int pixel = 0; pixel < width; ++pixel) {
         const int bin = spectrumBinForPixel(pixel, width);
         const int dbfs = -100 + smooth[bin] * 100 / 255;
         int y = kPlotTop + (int)lroundf((plotTopDbfs - dbfs) * (plotHeight - 1) / span);
         if (y < kPlotTop) y = kPlotTop;
-        if (y > kPlotTop + plotHeight - 1) y = kPlotTop + plotHeight - 1;
+        if (y > bottom - 1) y = bottom - 1;
         const int x = kPlotLeft + pixel;
-        tft.drawFastVLine(x, kPlotTop, plotHeight, color::BG);
+        const bool inTable = haveTable && x < tableX1;
+        const int top = inTable ? tableBottom : kPlotTop;       // the table rectangle is left untouched
+        const int yc = y < top ? top : y;
+        int markerK = -1;
+        for (int k = 0; k < kMaxMarkers; ++k) if (markerOn[k] && pixel == markerPixel[k]) markerK = k;
+        if (markerK >= 0) {                                      // solid marker line: nothing else in this column
+            tft.drawFastVLine(x, top, bottom - top, markerColor(markerK));
+            prevY = yc;
+            prevHoldY = -1;
+            continue;
+        }
+        const bool filled = traceMode == kTraceFilledGreen || traceMode == kTraceFilledAmber
+                            || traceMode == kTraceFilledCyan;
+        if (filled || (traceMode == kTraceGradient && plotHeight <= kMaxPlotHeight)) {
+            // background above the trace, fill below: disjoint, so no clear-then-redraw flicker
+            if (yc > top) tft.drawFastVLine(x, top, yc - top, color::BG);
+        } else {
+            tft.drawFastVLine(x, top, bottom - top, color::BG);
+        }
         if (traceMode == kTraceGradient && plotHeight <= kMaxPlotHeight) {
             tft.startWrite();
-            tft.setAddrWindow(x, y, 1, kPlotTop + plotHeight - y);
-            tft.pushColors(rowGradient + (y - kPlotTop), kPlotTop + plotHeight - y);
+            tft.setAddrWindow(x, yc, 1, bottom - yc);
+            tft.pushColors(rowGradient + (yc - kPlotTop), bottom - yc);
             tft.endWrite();
         } else {
             uint16_t traceColor = color::TRACE_GREEN;
@@ -634,25 +775,20 @@ static void drawSpectrumTrace(int width, int right) {
                 traceColor = color::TRACE_CYAN;
                 fillColor = color::FILL_CYAN;
             }
-            if (traceMode == kTraceFilledGreen || traceMode == kTraceFilledAmber
-                || traceMode == kTraceFilledCyan)
-                tft.drawFastVLine(x, y, kPlotTop + plotHeight - y, fillColor);
-            // Each segment only touches columns x-1 and x, so the per-column
-            // clear above never erases it.
-            if (pixel > 0) tft.drawLine(x - 1, prevY, x, y, traceColor);
-            else tft.drawPixel(x, y, traceColor);
+            if (filled) tft.drawFastVLine(x, yc, bottom - yc, fillColor);
+            if (pixel > 0) tft.drawLine(x - 1, prevY < top ? top : prevY, x, yc, traceColor);
+            else tft.drawPixel(x, yc, traceColor);
         }
-        prevY = y;
-        if (markerOn && pixel == markerPixel) tft.drawFastVLine(x, kPlotTop, plotHeight, color::BRIGHT);
+        prevY = yc;
         if (selOn) {                                    // range being dragged: edges and a bar on top
             const int a = selX0 < selX1 ? selX0 : selX1, b = selX0 < selX1 ? selX1 : selX0;
-            if (pixel == a || pixel == b) tft.drawFastVLine(x, kPlotTop, plotHeight, color::rgb(0, 220, 255));
-            else if (pixel > a && pixel < b) tft.drawPixel(x, kPlotTop + 1, color::rgb(0, 220, 255));
+            if (pixel == a || pixel == b) tft.drawFastVLine(x, top, bottom - top, color::rgb(0, 220, 255));
+            else if (pixel > a && pixel < b && !inTable) tft.drawPixel(x, kPlotTop + 1, color::rgb(0, 220, 255));
         }
         if (holdOn) {                                   // max hold line on top of the trace
             int hy = kPlotTop + (int)lroundf((plotTopDbfs - (-100 + holdBins[bin] * 100 / 255)) * (plotHeight - 1) / span);
-            if (hy < kPlotTop) hy = kPlotTop;
-            if (hy > kPlotTop + plotHeight - 1) hy = kPlotTop + plotHeight - 1;
+            if (hy < top) hy = top;
+            if (hy > bottom - 1) hy = bottom - 1;
             if (prevHoldY >= 0) tft.drawLine(x - 1, prevHoldY, x, hy, color::rgb(255, 210, 0));
             prevHoldY = hy;
         }
@@ -676,7 +812,7 @@ static void drawFrame(const SpectrumFrame& frame) {
     static int lastLow = 0, lastHigh = 0, lastCentre = 0;
     if (frame.lowMHz != lastLow || frame.highMHz != lastHigh || gCaptureCenterMHz != lastCentre) {
         memset(holdBins, 0, sizeof(holdBins));          // new range/centre: restart max hold
-        markerOn = false;
+        clearMarkers();
         lastLow = frame.lowMHz; lastHigh = frame.highMHz; lastCentre = gCaptureCenterMHz;
     }
     if (!frame.valid || frame.gain != lastGain || frame.burstFiltered != lastFilter
@@ -692,7 +828,7 @@ static void drawFrame(const SpectrumFrame& frame) {
     char status[64];
     if (!frame.valid) snprintf(status, sizeof(status), "%s", frame.error);
     else if (frame.clipped) snprintf(status, sizeof(status), "CLIPPING (gain %u)", frame.gain);
-    else if (markerOn) markerText(status, sizeof(status), false);
+    else if (markerCount() && plotHeight < 22) markerText(markerLast, status, sizeof(status));
     else if (frame.wide)
         snprintf(status, sizeof(status), "SWEEP %d-%d MHz | %d kHz/bin", frame.lowMHz, frame.highMHz,
                  (frame.highMHz - frame.lowMHz) * 1000 / kSpectrumBins);
@@ -702,7 +838,7 @@ static void drawFrame(const SpectrumFrame& frame) {
     else snprintf(status, sizeof(status), "%d bins | 31.25 kHz spacing", kSpectrumBins);
     static uint16_t lastStatusColor = 0;
     const uint16_t statusColor = !(frame.valid && !frame.clipped) ? color::ERROR
-        : markerOn ? color::rgb(255, 210, 0) : color::MID;
+        : markerCount() && plotHeight < 22 ? markerColor(markerLast) : color::MID;
     if (strcmp(status, lastStatus) || statusColor != lastStatusColor) {
         tft.fillRect(0, kStatusY, tft.width(), kPlotTop - kStatusY, color::BG);
         tft.setTextDatum(TC_DATUM);
@@ -733,7 +869,10 @@ static void drawFrame(const SpectrumFrame& frame) {
     }
     drawTransmissionCenterLabel();
     if (!frame.wide) reportTransmission(false);
-    if (plotHeight > 0) drawSpectrumTrace(width, right);
+    if (plotHeight > 0) {
+        drawSpectrumTrace(width, right);
+        drawMarkerTable();
+    }
 
     memcpy(waterfall[waterfallHead], frame.bins, sizeof(frame.bins));
     waterfallHead = (waterfallHead + 1) % kMaxWaterfallRows;
@@ -916,15 +1055,20 @@ static void singleTapAction(int x, int y) {
     int pixel = x - kPlotLeft;
     if (pixel < 0) pixel = 0;
     if (pixel > markerWidth - 1) pixel = markerWidth - 1;
-    if (markerOn && abs(pixel - markerPixel) <= 10) {
-        markerOn = false;
-        memset(lastStatus, 0, sizeof(lastStatus));
-    } else {
-        markerPixel = pixel;
-        markerOn = true;
-        char t[64];
-        markerText(t, sizeof(t), true);
+    for (int k = 0; k < kMaxMarkers; ++k) {
+        if (markerOn[k] && abs(pixel - markerPixel[k]) <= 10) {      // tap next to a marker: clear it
+            markerOn[k] = false;
+            memset(lastStatus, 0, sizeof(lastStatus));
+            return;
+        }
     }
+    int k = 0;
+    while (k < kMaxMarkers && markerOn[k]) ++k;
+    if (k == kMaxMarkers) { k = markerNext; markerNext = (markerNext + 1) % kMaxMarkers; }   // all used: replace the oldest
+    markerPixel[k] = pixel;
+    markerOn[k] = true;
+    markerLast = k;
+    printMarkers();
 }
 
 constexpr uint32_t kReleaseHoldMs = 100;
@@ -1005,7 +1149,7 @@ static void drawMenu() {
     const int sw2 = (W - 3 * g) * 62 / 100;
     menuButtons[n++] = {g, H * 72 / 100, sw2, H * 24 / 100, "OK"};
     menuButtons[n++] = {2 * g + sw2, H * 72 / 100, W - 3 * g - sw2, H * 24 / 100, "HOLD"};
-    menuButtons[n++] = {W - 34, 2, 32, 26, "X"};     // close without changing anything
+    menuButtons[n++] = {W - 34, 2, 32, 26, "C"};     // close without changing anything
     menuButtonCount = n;
     drawMenuButton(menuButtons[0], menuMode == kRangeNarrow && menuCenter == kCaptureCenterMHz, color::DIM);
     drawMenuButton(menuButtons[1], menuMode == kRangeWlan, color::DIM);
@@ -1069,7 +1213,7 @@ static void menuTapped(int x, int y) {
         } else if (i == 8) {
             holdOn = !holdOn;
             memset(holdBins, 0, sizeof(holdBins));
-        } else if (i == 9) {               // X: close, keep the current view
+        } else if (i == 9) {               // C: close, keep the current view
             menuMode = gRangeMode;
             menuCenter = gCaptureCenterMHz;
             exitMenu();
@@ -1135,7 +1279,7 @@ static void handleModeInput() {
             drawHoldButton();
             return;
         }
-        if (lastX >= 32 && lastX < 66 && lastY < 36) {   // C corner button: original zoom
+        if (lastX >= 32 && lastX < 66 && lastY < 36) {   // N corner button: original zoom
             wasTouched = touched;
             resetZoom();
             return;
@@ -1222,6 +1366,12 @@ static void handleSerial() {
                 if (!strncmp(line, "freq ", 5) || !strncmp(line, "range ", 6) || !strcmp(line, "qo100")
                     || !strcmp(line, "rangewlan") || !strcmp(line, "maxrange"))
                     clearZoom();
+                if (!strcmp(line, "marker") || !strcmp(line, "marker clear")) {
+                    if (!strcmp(line, "marker clear")) { clearMarkers(); memset(lastStatus, 0, sizeof(lastStatus)); }
+                    printMarkers();
+                    used = 0;
+                    continue;
+                }
                 if (!strcmp(line, "hold") || !strncmp(line, "hold ", 5)) {
                     if (!strcmp(line, "hold clear")) memset(holdBins, 0, sizeof(holdBins));
                     else if (!strcmp(line, "hold off")) holdOn = false;
@@ -1319,7 +1469,7 @@ static void handleSerial() {
                     used = 0;
                     continue;
                 }
-                Serial.println("Commands: range <start> <end> (MHz sweep) | hold [on|off|clear] (max hold line) | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
+                Serial.println("Commands: range <start> <end> (MHz sweep) | hold [on|off|clear] (max hold line) | marker [clear] | status | stop | start | qo100 | rangewlan | maxrange | cal [kHz] | calref <MHz> | freq <MHz> (centre, 2300-2500) | burst 0|1 | layout 0-2 (both|spectrum|waterfall) | mode 0-4 (line|filled-green|filled-amber|filled-cyan|gradient) | "
                                "wf 0-4 (classic|thermal|phosphor|gray|rainbow) | help");
             }
             used = 0; overflow = false;
@@ -1348,13 +1498,13 @@ static void drawHeader() {
     tft.drawRoundRect(tft.width() - 30, 0, 30, 22, 4, color::MID);
     tft.setTextColor(color::BRIGHT, color::DIM);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("=", tft.width() - 15, 11, 4);
+    tft.drawString("C", tft.width() - 15, 11, 2);
     drawHoldButton();
-    tft.fillRoundRect(32, 0, 30, 22, 4, color::DIM);     // C: back to the original (unzoomed) view
+    tft.fillRoundRect(32, 0, 30, 22, 4, color::DIM);     // N (normal): back to the original (unzoomed) view
     tft.drawRoundRect(32, 0, 30, 22, 4, color::MID);
     tft.setTextColor(color::BRIGHT, color::DIM);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("C", 47, 11, 4);
+    tft.drawString("N", 47, 11, 2);
 }
 
 // Max hold button, top left (mirror of the menu button); yellow while max hold is on.
