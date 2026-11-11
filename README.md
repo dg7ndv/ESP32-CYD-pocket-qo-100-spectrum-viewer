@@ -1,4 +1,18 @@
-> **Extended fork by DG7NDV** — tunable 2300–2500 MHz receive range, wide sweep views, touch menu, web page and extra serial commands. See **[EXTENDED.md](EXTENDED.md)**. The browser installer below installs the original HB9IIU firmware.
+# EXTENDED VERSION by DG7NDV
+
+**This fork extends HB9IIU's viewer from a fixed QO-100 view to a tunable 2.4 GHz spectrum viewer** (tested on the 2.8" CYD, ESP32-2432S028).
+
+- **Tunable receive range 2300–2500 MHz** (`freq`), plus wide sweeps: WLAN (2400–2484), MAX (2300–2500) and any free range (`range <start> <end>`)
+- **Touch zoom:** press, hold and drag sideways to zoom into a frequency range; double tap or the `N` button returns to the original view
+- **Tap markers** with frequency and level of the strongest bin nearby, **max hold**, strongest peak (`PK`) in the sweep views
+- **Config menu** (`C` button, top right) with immediate QO-100 / WLAN / MAX view switch
+- **Serial control** (`start`, `stop`, `status`, `cal`, `[cf]` / `[pk]` output) and a small **Python control GUI** (`tools/spek_control.py`)
+- Header credit "by HB9IIU, extended by DG7NDV"
+
+**Ready-to-flash firmware:** see the [Releases](../../releases) page (merged image, flash at 0x0). **Documentation:** **[EXTENDED.md](EXTENDED.md)**.
+The browser installer below installs the **original** HB9IIU firmware, not this extended one.
+
+Original work: HB9IIU (Apache-2.0). Extensions: DG7NDV (2026).
 
 > **[Flash Pocket QO-100 Spectrum Viewer in your browser](https://hb9iiu.github.io/ESP32-CYD-pocket-qo-100-spectrum-viewer/)** — choose the 2.8-inch or 4-inch Classic ESP32 CYD installer; Chrome or Edge required.
 
